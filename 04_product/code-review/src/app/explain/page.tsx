@@ -2,8 +2,6 @@
 
 import { useState, useEffect, useRef, useCallback } from "react";
 import { useRouter } from "next/navigation";
-import ReactMarkdown from "react-markdown";
-import remarkGfm from "remark-gfm";
 import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
 import { atomDark } from "react-syntax-highlighter/dist/esm/styles/prism";
 import {
@@ -15,6 +13,7 @@ import {
   Loader2,
   ChevronDown,
 } from "lucide-react";
+import { CodeJumpMarkdown } from "@/components/CodeJumpMarkdown";
 
 interface ReviewRequest {
   code: string;
@@ -34,6 +33,28 @@ const LEVEL_LABEL: Record<string, string> = {
   engineer: "👨‍💻 エンジニア向け",
 };
 
+/** ソースコード内でスニペットを探し、最初にマッチした行番号（1始まり）を返す */
+function findLineNumber(sourceCode: string, snippet: string): number | null {
+  const trimmed = snippet.trim();
+  if (!trimmed || trimmed.length < 2) return null;
+
+  // 完全一致を試みる
+  let idx = sourceCode.indexOf(trimmed);
+
+  // 見つからない場合、スニペットの最初の非空行で再検索
+  if (idx === -1) {
+    const firstMeaningfulLine = trimmed
+      .split("\n")
+      .map((l) => l.trim())
+      .find((l) => l.length > 3);
+    if (!firstMeaningfulLine) return null;
+    idx = sourceCode.indexOf(firstMeaningfulLine);
+    if (idx === -1) return null;
+  }
+
+  return sourceCode.slice(0, idx).split("\n").length;
+}
+
 export default function ExplainPage() {
   const router = useRouter();
 
@@ -51,6 +72,11 @@ export default function ExplainPage() {
   const [question, setQuestion] = useState("");
   const [chatLoading, setChatLoading] = useState(false);
   const [copied, setCopied] = useState(false);
+
+  // コードジャンプ用
+  const [highlightLine, setHighlightLine] = useState<number | null>(null);
+  const codeViewerRef = useRef<HTMLDivElement>(null);
+  const highlightTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const chatBottomRef = useRef<HTMLDivElement>(null);
   const questionInputRef = useRef<HTMLInputElement>(null);
@@ -72,6 +98,13 @@ export default function ExplainPage() {
   useEffect(() => {
     chatBottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [chatHistory, explanation]);
+
+  // アンマウント時にタイマーをクリア
+  useEffect(() => {
+    return () => {
+      if (highlightTimerRef.current) clearTimeout(highlightTimerRef.current);
+    };
+  }, []);
 
   async function generateExplanation(req: ReviewRequest) {
     setLoading(true);
@@ -105,6 +138,37 @@ export default function ExplainPage() {
       setLoading(false);
     }
   }
+
+  /** 解説内コードをクリック → 左パネルの該当行にスクロール＋ハイライト */
+  const jumpToCode = useCallback(
+    (snippet: string) => {
+      if (!request?.code) return;
+
+      const lineNum = findLineNumber(request.code, snippet);
+      if (!lineNum) return;
+
+      // 既存ハイライトをリセット
+      if (highlightTimerRef.current) clearTimeout(highlightTimerRef.current);
+      setHighlightLine(null);
+
+      // DOM更新後にスクロール
+      requestAnimationFrame(() => {
+        setHighlightLine(lineNum);
+
+        const container = codeViewerRef.current;
+        const el = container?.querySelector(`[data-line="${lineNum}"]`);
+        if (el) {
+          el.scrollIntoView({ behavior: "smooth", block: "center" });
+        }
+
+        // 2.5秒後にハイライト解除
+        highlightTimerRef.current = setTimeout(() => {
+          setHighlightLine(null);
+        }, 2500);
+      });
+    },
+    [request]
+  );
 
   const handleCopy = useCallback(async () => {
     await navigator.clipboard.writeText(explanation);
@@ -161,6 +225,11 @@ export default function ExplainPage() {
   }, [question, chatLoading, request, chatHistory]);
 
   if (!request) return null;
+
+  const syntaxLang = request.language
+    .toLowerCase()
+    .replace("c++", "cpp")
+    .replace("その他", "text");
 
   return (
     <div className="h-screen flex flex-col overflow-hidden" style={{ background: "var(--background)" }}>
@@ -226,19 +295,50 @@ export default function ExplainPage() {
             style={{ borderColor: "var(--border)", color: "var(--muted)", background: "var(--surface)" }}
           >
             <span className="font-mono">{request.language}</span>
-            <span>{request.code.split("\n").length} 行</span>
+            <span className="flex items-center gap-2">
+              <span>{request.code.split("\n").length} 行</span>
+              {highlightLine && (
+                <span
+                  className="px-1.5 py-0.5 rounded text-xs font-medium animate-pulse"
+                  style={{ background: "rgba(250,204,21,0.2)", color: "#ca8a04" }}
+                >
+                  → {highlightLine} 行目
+                </span>
+              )}
+            </span>
           </div>
-          <div className="flex-1 overflow-auto">
+          {/* ref を付与してジャンプ対象の行を querySelector で探す */}
+          <div ref={codeViewerRef} className="flex-1 overflow-auto">
             <SyntaxHighlighter
-              language={request.language.toLowerCase().replace("c++", "cpp").replace("その他", "text")}
+              language={syntaxLang}
               style={atomDark}
               showLineNumbers
+              wrapLines
+              lineProps={(lineNum) =>
+                ({
+                  "data-line": String(lineNum),
+                  style: {
+                    display: "block",
+                    paddingLeft: "4px",
+                    marginLeft: "-4px",
+                    borderLeft: lineNum === highlightLine
+                      ? "3px solid #facc15"
+                      : "3px solid transparent",
+                    background: lineNum === highlightLine
+                      ? "rgba(250,204,21,0.18)"
+                      : undefined,
+                    animation: lineNum === highlightLine
+                      ? "highlightFade 2.5s ease forwards"
+                      : undefined,
+                    transition: "background 0.3s, border-color 0.3s",
+                  },
+                } as React.HTMLProps<HTMLElement>)
+              }
               wrapLongLines={false}
               customStyle={{
                 margin: 0,
                 borderRadius: 0,
                 fontSize: "0.8125rem",
-                height: "100%",
                 minHeight: "100%",
               }}
             >
@@ -256,8 +356,16 @@ export default function ExplainPage() {
               style={{ borderColor: "var(--border)", background: "var(--surface)", color: "var(--muted)" }}
             >
               <span>🕐 {(meta.elapsed_ms / 1000).toFixed(1)}s</span>
-              <span>📊 入力 {meta.input_tokens.toLocaleString()} / 出力 {meta.output_tokens.toLocaleString()} tokens</span>
+              <span>
+                📊 入力 {meta.input_tokens.toLocaleString()} / 出力{" "}
+                {meta.output_tokens.toLocaleString()} tokens
+              </span>
               <span>💰 ${meta.cost_usd.toFixed(4)}</span>
+              {explanation && (
+                <span style={{ color: "rgba(124,58,237,0.7)" }}>
+                  💡 コードをクリックでソースにジャンプ
+                </span>
+              )}
             </div>
           )}
 
@@ -285,9 +393,10 @@ export default function ExplainPage() {
 
             {explanation && (
               <div className="prose max-w-none">
-                <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                  {explanation}
-                </ReactMarkdown>
+                <CodeJumpMarkdown
+                  markdown={explanation}
+                  onCodeClick={jumpToCode}
+                />
               </div>
             )}
 
@@ -306,18 +415,22 @@ export default function ExplainPage() {
                     {msg.role === "user" ? (
                       <div
                         className="max-w-[80%] px-4 py-2 rounded-2xl rounded-tr-sm text-sm"
-                        style={{ background: "linear-gradient(135deg, #7c3aed, #2563eb)", color: "#fff" }}
+                        style={{
+                          background: "linear-gradient(135deg, #7c3aed, #2563eb)",
+                          color: "#fff",
+                        }}
                       >
                         {msg.content}
                       </div>
                     ) : (
                       <div
-                        className="prose max-w-none p-4 rounded-2xl rounded-tl-sm text-sm"
+                        className="prose max-w-none p-4 rounded-2xl rounded-tl-sm text-sm w-full"
                         style={{ background: "var(--surface)" }}
                       >
-                        <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                          {msg.content}
-                        </ReactMarkdown>
+                        <CodeJumpMarkdown
+                          markdown={msg.content}
+                          onCodeClick={jumpToCode}
+                        />
                       </div>
                     )}
                   </div>

@@ -104,6 +104,23 @@ body {
 .prose a { color: var(--accent-from); text-decoration: underline; }
 .prose strong { font-weight: 700; }
 
+/* クリック可能なインラインコード */
+.prose code[title] {
+  text-decoration: underline dotted rgba(124,58,237,0.5);
+  transition: background 0.15s;
+}
+.prose code[title]:hover {
+  background: rgba(124,58,237,0.12);
+  color: #7c3aed;
+}
+
+/* ライン強調アニメーション */
+@keyframes highlightFade {
+  0%   { background: rgba(250,204,21,0.45); border-left-color: #facc15; }
+  70%  { background: rgba(250,204,21,0.35); border-left-color: #facc15; }
+  100% { background: transparent; border-left-color: transparent; }
+}
+
 /* Scrollbar */
 ::-webkit-scrollbar { width: 6px; height: 6px; }
 ::-webkit-scrollbar-track { background: transparent; }
