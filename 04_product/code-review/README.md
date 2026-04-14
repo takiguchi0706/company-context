@@ -8,8 +8,7 @@
 
 ## デモURL
 
-> Vercel デプロイ後に差し替え予定
-> `https://code-review.vercel.app`（仮）
+https://code-review-kappa-rosy.vercel.app
 
 ## 機能
 
