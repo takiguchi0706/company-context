@@ -33,26 +33,84 @@ const LEVEL_LABEL: Record<string, string> = {
   engineer: "👨‍💻 エンジニア向け",
 };
 
-/** ソースコード内でスニペットを探し、最初にマッチした行番号（1始まり）を返す */
-function findLineNumber(sourceCode: string, snippet: string): number | null {
+// ─── マッチングユーティリティ ─────────────────────────────────────────────
+
+/** タブ→スペース、連続スペース→1つ、trim */
+function normalizeWS(s: string): string {
+  return s.replace(/\t/g, " ").replace(/ {2,}/g, " ").trim();
+}
+
+/** ソース内の全出現位置を 1-based 行番号の配列で返す */
+function allLineOccurrences(src: string, needle: string): number[] {
+  const result: number[] = [];
+  let start = 0;
+  while (true) {
+    const idx = src.indexOf(needle, start);
+    if (idx === -1) break;
+    result.push(src.slice(0, idx).split("\n").length);
+    start = idx + 1;
+  }
+  return result;
+}
+
+/** 識別子（英数字アンダースコア、3文字以上）を抽出して長い順に返す */
+function extractIdentifiers(s: string): string[] {
+  const matches = [...s.matchAll(/[a-zA-Z_$][a-zA-Z0-9_$]{2,}/g)].map((m) => m[0]);
+  return [...new Set(matches)].sort((a, b) => b.length - a.length);
+}
+
+const ELLIPSIS_LINES = new Set(["...", "// ...", "# ...", "/* ... */", "…"]);
+
+/**
+ * 多段フォールバックでマッチする行番号（1-based）を全て返す
+ * Step1: 完全一致 → Step2: 意味のある行単位一致 → Step3: 空白正規化行マッチ
+ * → Step4: 最長識別子 \b正規表現 → Step5: 空配列（未マッチ）
+ */
+function findMatchingLines(sourceCode: string, snippet: string): number[] {
   const trimmed = snippet.trim();
-  if (!trimmed || trimmed.length < 2) return null;
+  if (!trimmed || trimmed.length < 2) return [];
 
-  // 完全一致を試みる
-  let idx = sourceCode.indexOf(trimmed);
+  // Step 1: 完全一致
+  const exact = allLineOccurrences(sourceCode, trimmed);
+  if (exact.length > 0) return exact;
 
-  // 見つからない場合、スニペットの最初の非空行で再検索
-  if (idx === -1) {
-    const firstMeaningfulLine = trimmed
-      .split("\n")
-      .map((l) => l.trim())
-      .find((l) => l.length > 3);
-    if (!firstMeaningfulLine) return null;
-    idx = sourceCode.indexOf(firstMeaningfulLine);
-    if (idx === -1) return null;
+  const srcLines = sourceCode.split("\n");
+  const normSrcLines = srcLines.map(normalizeWS);
+
+  // Step 2 & 3: 意味のある行（省略・空行を除く）を1行ずつ検索
+  const candidateLines = trimmed
+    .split("\n")
+    .map((l) => l.trim())
+    .filter((l) => l.length > 3 && !ELLIPSIS_LINES.has(l));
+
+  for (const line of candidateLines) {
+    // Step 2: そのまま substring match
+    const direct = allLineOccurrences(sourceCode, line);
+    if (direct.length > 0) return direct;
+
+    // Step 3: 空白正規化
+    const normLine = normalizeWS(line);
+    const normMatches = normSrcLines.reduce<number[]>((acc, srcLine, i) => {
+      if (srcLine === normLine || srcLine.includes(normLine)) acc.push(i + 1);
+      return acc;
+    }, []);
+    if (normMatches.length > 0) return normMatches;
   }
 
-  return sourceCode.slice(0, idx).split("\n").length;
+  // Step 4: 最長識別子で \b正規表現マッチ
+  const identifiers = extractIdentifiers(trimmed);
+  for (const id of identifiers) {
+    const escaped = id.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const regex = new RegExp(`\\b${escaped}\\b`, "g");
+    const lineNums: number[] = [];
+    let m: RegExpExecArray | null;
+    while ((m = regex.exec(sourceCode)) !== null) {
+      lineNums.push(sourceCode.slice(0, m.index).split("\n").length);
+    }
+    if (lineNums.length > 0) return [...new Set(lineNums)];
+  }
+
+  return [];
 }
 
 export default function ExplainPage() {
@@ -75,8 +133,15 @@ export default function ExplainPage() {
 
   // コードジャンプ用
   const [highlightLine, setHighlightLine] = useState<number | null>(null);
+  const [notFoundFlash, setNotFoundFlash] = useState(false);
   const codeViewerRef = useRef<HTMLDivElement>(null);
   const highlightTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const notFoundTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // 連続クリックで次のマッチへ進むための状態
+  const lastJumpRef = useRef<{ snippet: string; matchIndex: number }>({
+    snippet: "",
+    matchIndex: -1,
+  });
 
   const chatBottomRef = useRef<HTMLDivElement>(null);
   const questionInputRef = useRef<HTMLInputElement>(null);
@@ -103,6 +168,7 @@ export default function ExplainPage() {
   useEffect(() => {
     return () => {
       if (highlightTimerRef.current) clearTimeout(highlightTimerRef.current);
+      if (notFoundTimerRef.current) clearTimeout(notFoundTimerRef.current);
     };
   }, []);
 
@@ -139,32 +205,43 @@ export default function ExplainPage() {
     }
   }
 
-  /** 解説内コードをクリック → 左パネルの該当行にスクロール＋ハイライト */
+  /** 解説内コードをクリック → 左パネルの該当行にスクロール＋ハイライト（連続クリックで次のマッチへ） */
   const jumpToCode = useCallback(
     (snippet: string) => {
       if (!request?.code) return;
 
-      const lineNum = findLineNumber(request.code, snippet);
-      if (!lineNum) return;
+      const matches = findMatchingLines(request.code, snippet);
+
+      if (matches.length === 0) {
+        console.warn("[code-jump] no match for:", snippet.slice(0, 80));
+        if (notFoundTimerRef.current) clearTimeout(notFoundTimerRef.current);
+        setNotFoundFlash(true);
+        notFoundTimerRef.current = setTimeout(() => setNotFoundFlash(false), 2000);
+        return;
+      }
+
+      // 同じスニペットの連続クリック → 次のマッチへ（ラップあり）
+      let matchIndex = 0;
+      if (lastJumpRef.current.snippet === snippet) {
+        matchIndex = (lastJumpRef.current.matchIndex + 1) % matches.length;
+      }
+      lastJumpRef.current = { snippet, matchIndex };
+
+      const lineNum = matches[matchIndex];
 
       // 既存ハイライトをリセット
       if (highlightTimerRef.current) clearTimeout(highlightTimerRef.current);
       setHighlightLine(null);
 
-      // DOM更新後にスクロール
       requestAnimationFrame(() => {
         setHighlightLine(lineNum);
 
-        const container = codeViewerRef.current;
-        const el = container?.querySelector(`[data-line="${lineNum}"]`);
+        const el = codeViewerRef.current?.querySelector(`[data-line="${lineNum}"]`);
         if (el) {
           el.scrollIntoView({ behavior: "smooth", block: "center" });
         }
 
-        // 2.5秒後にハイライト解除
-        highlightTimerRef.current = setTimeout(() => {
-          setHighlightLine(null);
-        }, 2500);
+        highlightTimerRef.current = setTimeout(() => setHighlightLine(null), 2500);
       });
     },
     [request]
@@ -297,12 +374,20 @@ export default function ExplainPage() {
             <span className="font-mono">{request.language}</span>
             <span className="flex items-center gap-2">
               <span>{request.code.split("\n").length} 行</span>
-              {highlightLine && (
+              {highlightLine && !notFoundFlash && (
                 <span
-                  className="px-1.5 py-0.5 rounded text-xs font-medium animate-pulse"
+                  className="px-1.5 py-0.5 rounded text-xs font-medium"
                   style={{ background: "rgba(250,204,21,0.2)", color: "#ca8a04" }}
                 >
                   → {highlightLine} 行目
+                </span>
+              )}
+              {notFoundFlash && (
+                <span
+                  className="px-1.5 py-0.5 rounded text-xs font-medium animate-pulse"
+                  style={{ background: "rgba(239,68,68,0.15)", color: "#dc2626" }}
+                >
+                  ⚠ 対応箇所が見つかりません
                 </span>
               )}
             </span>

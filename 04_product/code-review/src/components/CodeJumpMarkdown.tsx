@@ -58,6 +58,11 @@ export function CodeJumpMarkdown({ markdown, onCodeClick }: Props) {
         );
       }
 
+      // 1文字以下はクリック無効（`i`、`n` 等）
+      if (text.length <= 1) {
+        return <code className={codeClass} {...props}>{children}</code>;
+      }
+
       // インラインコード
       return (
         <code
