@@ -1,10 +1,10 @@
 "use client";
 
-import { useState, useCallback, useTransition, startTransition } from "react";
+import { useState, useCallback, useTransition, useEffect } from "react";
 import { useRouter } from "next/navigation";
 import { BookOpen, GitBranch, FolderOpen, Loader2, ChevronRight } from "lucide-react";
 import { clsx } from "clsx";
-import { preloadRoute } from "@/lib/performance";
+import { preloadRoute, useDebounce, PerformanceMonitor, dedupeRequest } from "@/lib/performance";
 
 const LANGUAGES = [
   "TypeScript",
@@ -38,55 +38,100 @@ export default function HomePage() {
 
   const canSubmit = code.trim().length > 0 && !isPending;
 
-  // 説明ページのプリロード
-  useState(() => {
+  // 初期化時のプリロード
+  useEffect(() => {
+    PerformanceMonitor.mark('page-init');
+    
+    // 重要なルートをプリロード
     preloadRoute("/explain");
-  });
+    
+    // Service Worker の準備状況をチェック
+    if ('serviceWorker' in navigator) {
+      navigator.serviceWorker.ready.then(() => {
+        PerformanceMonitor.mark('sw-ready');
+      });
+    }
 
+    PerformanceMonitor.measure('page-init-complete', 'page-init');
+  }, []);
+
+  // GitHubコード読み込み（デデュープ付き）
   const handleLoadGithub = useCallback(async (type: "url" | "company") => {
     const value = type === "url" ? githubUrl : companyPath;
     if (!value.trim()) return;
 
+    PerformanceMonitor.mark('github-load-start');
+    
+    const requestKey = `github-${type}-${value.trim()}`;
     setLoadingGithub(true);
     setGithubError("");
+    
     try {
-      const res = await fetch("/api/github", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ type, value: value.trim() }),
+      const data = await dedupeRequest(requestKey, async () => {
+        const res = await fetch("/api/github", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ type, value: value.trim() }),
+        });
+        
+        if (!res.ok) {
+          const errorData = await res.json();
+          throw new Error(errorData.error ?? "読み込みに失敗しました");
+        }
+        
+        return res.json();
       });
-      const data = await res.json();
-      if (!res.ok) {
-        setGithubError(data.error ?? "読み込みに失敗しました");
-        return;
-      }
+
       setCode(data.code);
       if (data.detected_language && data.detected_language !== "その他") {
         setLanguage(data.detected_language);
       }
       setTab("paste");
-    } catch {
-      setGithubError("ネットワークエラーが発生しました");
+      
+      PerformanceMonitor.measure('github-load-complete', 'github-load-start');
+      
+    } catch (error) {
+      const errorMessage = error instanceof Error 
+        ? error.message 
+        : "ネットワークエラーが発生しました";
+      setGithubError(errorMessage);
     } finally {
       setLoadingGithub(false);
     }
   }, [githubUrl, companyPath]);
 
+  // 解説ページへの遷移（最適化）
   const handleSubmit = useCallback((mode: Mode) => {
     if (!canSubmit) return;
     
+    PerformanceMonitor.mark('navigation-start');
+    
+    // データを準備
+    const requestData = { code, language, level, mode };
+    
     startTransition(() => {
-      sessionStorage.setItem(
-        "review-request",
-        JSON.stringify({ code, language, level, mode })
-      );
+      // セッションストレージに保存
+      sessionStorage.setItem("review-request", JSON.stringify(requestData));
+      
+      // ページ遷移
       router.push("/explain");
+      
+      PerformanceMonitor.measure('navigation-complete', 'navigation-start');
     });
   }, [code, language, level, canSubmit, router]);
 
+  // デバウンスされたイベントハンドラー
+  const debouncedCodeChange = useDebounce(useCallback((value: string) => {
+    setCode(value);
+  }, []), 100);
+
   const handleCodeChange = useCallback((e: React.ChangeEvent<HTMLTextAreaElement>) => {
-    setCode(e.target.value);
-  }, []);
+    const value = e.target.value;
+    // 即座にUIを更新
+    setCode(value);
+    // デバウンスされた処理
+    debouncedCodeChange(value);
+  }, [debouncedCodeChange]);
 
   const handleLanguageChange = useCallback((e: React.ChangeEvent<HTMLSelectElement>) => {
     setLanguage(e.target.value);
@@ -97,7 +142,8 @@ export default function HomePage() {
   }, []);
 
   const handleKeyDown = useCallback((e: React.KeyboardEvent) => {
-    if (e.key === "Enter") {
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
       if (tab === "github-url" && githubUrl.trim()) {
         handleLoadGithub("url");
       } else if (tab === "company" && companyPath.trim()) {
@@ -105,6 +151,12 @@ export default function HomePage() {
       }
     }
   }, [tab, githubUrl, companyPath, handleLoadGithub]);
+
+  // タブ切り替え
+  const handleTabChange = useCallback((newTab: Tab) => {
+    setTab(newTab);
+    setGithubError(""); // エラーをリセット
+  }, []);
 
   return (
     <div className="min-h-screen" style={{ background: "var(--background)" }}>
@@ -133,7 +185,7 @@ export default function HomePage() {
           ).map(({ key, label, icon }) => (
             <button
               key={key}
-              onClick={() => setTab(key)}
+              onClick={() => handleTabChange(key)}
               className={clsx(
                 "flex items-center gap-2 px-3 py-2 rounded-md text-sm font-medium transition-all",
                 tab === key
@@ -167,11 +219,12 @@ export default function HomePage() {
                   color: "var(--foreground)",
                 }}
                 onKeyDown={handleKeyDown}
+                autoComplete="url"
               />
               <button
                 onClick={() => handleLoadGithub("url")}
                 disabled={!githubUrl.trim() || loadingGithub}
-                className="px-4 py-2 rounded-lg gradient-bg text-white text-sm font-medium disabled:opacity-50 flex items-center gap-2"
+                className="px-4 py-2 rounded-lg gradient-bg text-white text-sm font-medium disabled:opacity-50 flex items-center gap-2 transition-opacity"
               >
                 {loadingGithub ? <Loader2 className="w-4 h-4 animate-spin" /> : <ChevronRight className="w-4 h-4" />}
                 読み込む
@@ -181,7 +234,9 @@ export default function HomePage() {
               プライベートリポジトリは GITHUB_TOKEN 設定時にアクセス可能です
             </p>
             {githubError && (
-              <p className="text-sm text-red-500">{githubError}</p>
+              <p className="text-sm text-red-500 bg-red-50 border border-red-200 rounded px-2 py-1">
+                {githubError}
+              </p>
             )}
           </div>
         )}
@@ -205,11 +260,12 @@ export default function HomePage() {
                   color: "var(--foreground)",
                 }}
                 onKeyDown={handleKeyDown}
+                autoComplete="off"
               />
               <button
                 onClick={() => handleLoadGithub("company")}
                 disabled={!companyPath.trim() || loadingGithub}
-                className="px-4 py-2 rounded-lg gradient-bg text-white text-sm font-medium disabled:opacity-50 flex items-center gap-2"
+                className="px-4 py-2 rounded-lg gradient-bg text-white text-sm font-medium disabled:opacity-50 flex items-center gap-2 transition-opacity"
               >
                 {loadingGithub ? <Loader2 className="w-4 h-4 animate-spin" /> : <ChevronRight className="w-4 h-4" />}
                 読み込む
@@ -219,7 +275,9 @@ export default function HomePage() {
               takiguchi0706/company-context リポジトリのルートからの相対パス
             </p>
             {githubError && (
-              <p className="text-sm text-red-500">{githubError}</p>
+              <p className="text-sm text-red-500 bg-red-50 border border-red-200 rounded px-2 py-1">
+                {githubError}
+              </p>
             )}
           </div>
         )}
@@ -230,7 +288,7 @@ export default function HomePage() {
             コード
             {code.trim().length > 0 && (
               <span className="ml-2 text-xs" style={{ color: "var(--muted)" }}>
-                {code.split("\n").length} 行
+                {code.split("\n").length} 行・{code.length} 文字
               </span>
             )}
           </label>
@@ -239,13 +297,16 @@ export default function HomePage() {
             onChange={handleCodeChange}
             placeholder="ここにコードを貼り付けてください..."
             rows={20}
-            className="w-full px-4 py-3 rounded-lg border text-sm resize-y"
+            className="w-full px-4 py-3 rounded-lg border text-sm resize-y focus:ring-2 focus:ring-purple-500 focus:border-transparent transition-all"
             style={{
               background: "var(--surface)",
               borderColor: "var(--border)",
               color: "var(--foreground)",
               fontFamily: "var(--font-mono)",
+              minHeight: "400px",
             }}
+            spellCheck={false}
+            autoComplete="off"
           />
         </div>
 
@@ -259,7 +320,7 @@ export default function HomePage() {
             <select
               value={language}
               onChange={handleLanguageChange}
-              className="w-full px-3 py-2 rounded-lg border text-sm"
+              className="w-full px-3 py-2 rounded-lg border text-sm focus:ring-2 focus:ring-purple-500 focus:border-transparent transition-all"
               style={{
                 background: "var(--surface)",
                 borderColor: "var(--border)",
@@ -288,8 +349,8 @@ export default function HomePage() {
                 <label
                   key={value}
                   className={clsx(
-                    "flex items-start gap-3 px-3 py-2 rounded-lg border cursor-pointer transition-all",
-                    level === value ? "border-purple-500" : ""
+                    "flex items-start gap-3 px-3 py-2 rounded-lg border cursor-pointer transition-all hover:shadow-sm",
+                    level === value ? "border-purple-500 ring-2 ring-purple-500/20" : "hover:border-purple-300"
                   )}
                   style={{
                     background: level === value ? "rgba(124,58,237,0.08)" : "var(--surface)",
@@ -302,7 +363,7 @@ export default function HomePage() {
                     value={value}
                     checked={level === value}
                     onChange={() => handleLevelChange(value)}
-                    className="mt-0.5"
+                    className="mt-0.5 accent-purple-600"
                   />
                   <div>
                     <div className="text-sm font-medium" style={{ color: "var(--foreground)" }}>{label}</div>
@@ -319,7 +380,7 @@ export default function HomePage() {
           <button
             onClick={() => handleSubmit("explain")}
             disabled={!canSubmit}
-            className="flex items-center gap-2 px-6 py-3 rounded-lg gradient-bg text-white font-medium disabled:opacity-50 transition-opacity"
+            className="flex items-center gap-2 px-6 py-3 rounded-lg gradient-bg text-white font-medium disabled:opacity-50 transition-all hover:shadow-md disabled:hover:shadow-none"
           >
             {isPending ? <Loader2 className="w-4 h-4 animate-spin" /> : <BookOpen className="w-4 h-4" />}
             解説する
@@ -327,7 +388,7 @@ export default function HomePage() {
           <button
             onClick={() => handleSubmit("review")}
             disabled={!canSubmit}
-            className="flex items-center gap-2 px-6 py-3 rounded-lg border font-medium disabled:opacity-50 transition-opacity"
+            className="flex items-center gap-2 px-6 py-3 rounded-lg border font-medium disabled:opacity-50 transition-all hover:shadow-md disabled:hover:shadow-none hover:bg-gray-50"
             style={{
               borderColor: "var(--border)",
               color: "var(--foreground)",
@@ -338,6 +399,13 @@ export default function HomePage() {
             レビューする
           </button>
         </div>
+
+        {/* Performance indicators in development */}
+        {process.env.NODE_ENV === 'development' && (
+          <div className="mt-8 p-4 bg-gray-50 rounded-lg text-xs text-gray-600">
+            <p>🔧 開発モード: パフォーマンス測定有効</p>
+          </div>
+        )}
       </main>
     </div>
   );
