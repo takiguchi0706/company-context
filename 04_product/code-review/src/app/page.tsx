@@ -5,6 +5,7 @@ import { useRouter } from "next/navigation";
 import { BookOpen, GitBranch, FolderOpen, Loader2, ChevronRight } from "lucide-react";
 import { clsx } from "clsx";
 import { preloadRoute, useDebounce, PerformanceMonitor, dedupeRequest } from "@/lib/performance";
+import { usePerformance, useWebVitals } from "@/hooks/usePerformance";
 
 const LANGUAGES = [
   "TypeScript",
@@ -26,6 +27,10 @@ type Mode = "explain" | "review";
 export default function HomePage() {
   const router = useRouter();
   const [isPending, startTransition] = useTransition();
+  const { measurePerformance, trackInteraction, reportPerformance } = usePerformance('HomePage');
+
+  // Web Vitals tracking in development
+  useWebVitals();
 
   const [tab, setTab] = useState<Tab>("paste");
   const [code, setCode] = useState("");
@@ -38,108 +43,164 @@ export default function HomePage() {
 
   const canSubmit = code.trim().length > 0 && !isPending;
 
-  // 初期化時のプリロード
+  // 初期化時のプリロードと最適化
   useEffect(() => {
-    PerformanceMonitor.mark('page-init');
-    
-    // 重要なルートをプリロード
-    preloadRoute("/explain");
-    
-    // Service Worker の準備状況をチェック
-    if ('serviceWorker' in navigator) {
-      navigator.serviceWorker.ready.then(() => {
-        PerformanceMonitor.mark('sw-ready');
+    measurePerformance('initial-setup', () => {
+      PerformanceMonitor.mark('page-init');
+      
+      // 重要なルートをプリロード
+      preloadRoute("/explain");
+      
+      // 重いライブラリを遅延プリロード
+      const preloadTimer = setTimeout(() => {
+        // Syntax highlighter を background で準備
+        import('react-syntax-highlighter').catch(() => {});
+        // Markdown libraries を background で準備
+        Promise.all([
+          import('react-markdown').catch(() => {}),
+          import('remark-gfm').catch(() => {})
+        ]);
+      }, 2000);
+
+      // Service Worker の準備状況をチェック
+      if ('serviceWorker' in navigator) {
+        navigator.serviceWorker.ready.then(() => {
+          PerformanceMonitor.mark('sw-ready');
+          // Service Worker にプリフェッチリクエスト
+          navigator.serviceWorker.controller?.postMessage({
+            type: 'PREFETCH',
+            urls: ['/explain', '/api/review', '/api/chat']
+          });
+        });
+      }
+
+      PerformanceMonitor.measure('page-init-complete', 'page-init');
+      
+      return () => clearTimeout(preloadTimer);
+    });
+
+    // パフォーマンス報告（遅延）
+    const reportTimer = setTimeout(() => {
+      reportPerformance({
+        initialRender: performance.now()
       });
-    }
+    }, 5000);
 
-    PerformanceMonitor.measure('page-init-complete', 'page-init');
-  }, []);
+    return () => clearTimeout(reportTimer);
+  }, [measurePerformance, reportPerformance]);
 
-  // GitHubコード読み込み（デデュープ付き）
+  // GitHubコード読み込み（デデュープと最適化付き）
   const handleLoadGithub = useCallback(async (type: "url" | "company") => {
     const value = type === "url" ? githubUrl : companyPath;
     if (!value.trim()) return;
 
-    PerformanceMonitor.mark('github-load-start');
+    trackInteraction(`github-load-${type}`);
     
-    const requestKey = `github-${type}-${value.trim()}`;
-    setLoadingGithub(true);
-    setGithubError("");
-    
-    try {
-      const data = await dedupeRequest(requestKey, async () => {
-        const res = await fetch("/api/github", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ type, value: value.trim() }),
+    await measurePerformance(`github-load-${type}`, async () => {
+      const requestKey = `github-${type}-${value.trim()}`;
+      setLoadingGithub(true);
+      setGithubError("");
+      
+      try {
+        const data = await dedupeRequest(requestKey, async () => {
+          const controller = new AbortController();
+          const timeoutId = setTimeout(() => controller.abort(), 10000); // 10秒タイムアウト
+          
+          try {
+            const res = await fetch("/api/github", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ type, value: value.trim() }),
+              signal: controller.signal,
+            });
+            
+            clearTimeout(timeoutId);
+            
+            if (!res.ok) {
+              const errorData = await res.json();
+              throw new Error(errorData.error ?? "読み込みに失敗しました");
+            }
+            
+            return res.json();
+          } catch (error) {
+            clearTimeout(timeoutId);
+            throw error;
+          }
+        });
+
+        // UI更新をバッチ処理
+        requestAnimationFrame(() => {
+          setCode(data.code);
+          if (data.detected_language && data.detected_language !== "その他") {
+            setLanguage(data.detected_language);
+          }
+          setTab("paste");
         });
         
-        if (!res.ok) {
-          const errorData = await res.json();
-          throw new Error(errorData.error ?? "読み込みに失敗しました");
-        }
-        
-        return res.json();
-      });
-
-      setCode(data.code);
-      if (data.detected_language && data.detected_language !== "その他") {
-        setLanguage(data.detected_language);
+      } catch (error) {
+        const errorMessage = error instanceof Error 
+          ? error.message 
+          : "ネットワークエラーが発生しました";
+        setGithubError(errorMessage);
+      } finally {
+        setLoadingGithub(false);
       }
-      setTab("paste");
-      
-      PerformanceMonitor.measure('github-load-complete', 'github-load-start');
-      
-    } catch (error) {
-      const errorMessage = error instanceof Error 
-        ? error.message 
-        : "ネットワークエラーが発生しました";
-      setGithubError(errorMessage);
-    } finally {
-      setLoadingGithub(false);
-    }
-  }, [githubUrl, companyPath]);
+    });
+  }, [githubUrl, companyPath, measurePerformance, trackInteraction]);
 
-  // 解説ページへの遷移（最適化）
+  // 解説ページへの遷移（最適化版）
   const handleSubmit = useCallback((mode: Mode) => {
     if (!canSubmit) return;
     
-    PerformanceMonitor.mark('navigation-start');
+    trackInteraction(`submit-${mode}`);
     
-    // データを準備
-    const requestData = { code, language, level, mode };
-    
-    startTransition(() => {
-      // セッションストレージに保存
-      sessionStorage.setItem("review-request", JSON.stringify(requestData));
+    measurePerformance(`navigation-${mode}`, () => {
+      // データを準備
+      const requestData = { code, language, level, mode };
       
-      // ページ遷移
-      router.push("/explain");
-      
-      PerformanceMonitor.measure('navigation-complete', 'navigation-start');
+      startTransition(() => {
+        // セッションストレージに保存（非同期）
+        requestAnimationFrame(() => {
+          sessionStorage.setItem("review-request", JSON.stringify(requestData));
+        });
+        
+        // ページ遷移（即座に）
+        router.push("/explain");
+      });
     });
-  }, [code, language, level, canSubmit, router]);
+  }, [code, language, level, canSubmit, router, measurePerformance, trackInteraction]);
 
-  // デバウンスされたイベントハンドラー
+  // デバウンスされたイベントハンドラー（最適化）
   const debouncedCodeChange = useDebounce(useCallback((value: string) => {
-    setCode(value);
-  }, []), 100);
+    // 大きなテキストの処理を最適化
+    if (value.length > 10000) {
+      requestAnimationFrame(() => setCode(value));
+    } else {
+      setCode(value);
+    }
+  }, []), 150); // 150msに増加（重い処理用）
 
   const handleCodeChange = useCallback((e: React.ChangeEvent<HTMLTextAreaElement>) => {
     const value = e.target.value;
-    // 即座にUIを更新
-    setCode(value);
-    // デバウンスされた処理
+    
+    // 即座にUIを更新（小さなテキスト）
+    if (value.length <= 1000) {
+      setCode(value);
+    }
+    
+    // デバウンスされた処理（大きなテキスト）
     debouncedCodeChange(value);
   }, [debouncedCodeChange]);
 
   const handleLanguageChange = useCallback((e: React.ChangeEvent<HTMLSelectElement>) => {
     setLanguage(e.target.value);
-  }, []);
+    trackInteraction('language-change');
+  }, [trackInteraction]);
 
   const handleLevelChange = useCallback((newLevel: Level) => {
     setLevel(newLevel);
-  }, []);
+    trackInteraction('level-change');
+  }, [trackInteraction]);
 
   const handleKeyDown = useCallback((e: React.KeyboardEvent) => {
     if (e.key === "Enter" && !e.shiftKey) {
@@ -152,11 +213,12 @@ export default function HomePage() {
     }
   }, [tab, githubUrl, companyPath, handleLoadGithub]);
 
-  // タブ切り替え
+  // タブ切り替え（最適化）
   const handleTabChange = useCallback((newTab: Tab) => {
     setTab(newTab);
     setGithubError(""); // エラーをリセット
-  }, []);
+    trackInteraction(`tab-${newTab}`);
+  }, [trackInteraction]);
 
   return (
     <div className="min-h-screen" style={{ background: "var(--background)" }}>
@@ -212,7 +274,7 @@ export default function HomePage() {
                 value={githubUrl}
                 onChange={(e) => setGithubUrl(e.target.value)}
                 placeholder="github.com/owner/repo/blob/main/src/app/page.tsx"
-                className="flex-1 px-3 py-2 rounded-lg border text-sm font-mono"
+                className="flex-1 px-3 py-2 rounded-lg border text-sm font-mono transition-colors focus:ring-2 focus:ring-purple-500 focus:border-transparent"
                 style={{
                   background: "var(--surface)",
                   borderColor: "var(--border)",
@@ -224,7 +286,7 @@ export default function HomePage() {
               <button
                 onClick={() => handleLoadGithub("url")}
                 disabled={!githubUrl.trim() || loadingGithub}
-                className="px-4 py-2 rounded-lg gradient-bg text-white text-sm font-medium disabled:opacity-50 flex items-center gap-2 transition-opacity"
+                className="px-4 py-2 rounded-lg gradient-bg text-white text-sm font-medium disabled:opacity-50 flex items-center gap-2 transition-all hover:shadow-md disabled:hover:shadow-none"
               >
                 {loadingGithub ? <Loader2 className="w-4 h-4 animate-spin" /> : <ChevronRight className="w-4 h-4" />}
                 読み込む
@@ -234,9 +296,9 @@ export default function HomePage() {
               プライベートリポジトリは GITHUB_TOKEN 設定時にアクセス可能です
             </p>
             {githubError && (
-              <p className="text-sm text-red-500 bg-red-50 border border-red-200 rounded px-2 py-1">
+              <div className="text-sm text-red-500 bg-red-50 border border-red-200 rounded px-3 py-2 animate-in slide-in-from-top-2">
                 {githubError}
-              </p>
+              </div>
             )}
           </div>
         )}
@@ -253,7 +315,7 @@ export default function HomePage() {
                 value={companyPath}
                 onChange={(e) => setCompanyPath(e.target.value)}
                 placeholder="04_product/code-review/src/app/page.tsx"
-                className="flex-1 px-3 py-2 rounded-lg border text-sm font-mono"
+                className="flex-1 px-3 py-2 rounded-lg border text-sm font-mono transition-colors focus:ring-2 focus:ring-purple-500 focus:border-transparent"
                 style={{
                   background: "var(--surface)",
                   borderColor: "var(--border)",
@@ -265,7 +327,7 @@ export default function HomePage() {
               <button
                 onClick={() => handleLoadGithub("company")}
                 disabled={!companyPath.trim() || loadingGithub}
-                className="px-4 py-2 rounded-lg gradient-bg text-white text-sm font-medium disabled:opacity-50 flex items-center gap-2 transition-opacity"
+                className="px-4 py-2 rounded-lg gradient-bg text-white text-sm font-medium disabled:opacity-50 flex items-center gap-2 transition-all hover:shadow-md disabled:hover:shadow-none"
               >
                 {loadingGithub ? <Loader2 className="w-4 h-4 animate-spin" /> : <ChevronRight className="w-4 h-4" />}
                 読み込む
@@ -275,9 +337,9 @@ export default function HomePage() {
               takiguchi0706/company-context リポジトリのルートからの相対パス
             </p>
             {githubError && (
-              <p className="text-sm text-red-500 bg-red-50 border border-red-200 rounded px-2 py-1">
+              <div className="text-sm text-red-500 bg-red-50 border border-red-200 rounded px-3 py-2 animate-in slide-in-from-top-2">
                 {githubError}
-              </p>
+              </div>
             )}
           </div>
         )}
@@ -288,7 +350,7 @@ export default function HomePage() {
             コード
             {code.trim().length > 0 && (
               <span className="ml-2 text-xs" style={{ color: "var(--muted)" }}>
-                {code.split("\n").length} 行・{code.length} 文字
+                {code.split("\n").length} 行・{code.length.toLocaleString()} 文字
               </span>
             )}
           </label>
@@ -380,7 +442,7 @@ export default function HomePage() {
           <button
             onClick={() => handleSubmit("explain")}
             disabled={!canSubmit}
-            className="flex items-center gap-2 px-6 py-3 rounded-lg gradient-bg text-white font-medium disabled:opacity-50 transition-all hover:shadow-md disabled:hover:shadow-none"
+            className="flex items-center gap-2 px-6 py-3 rounded-lg gradient-bg text-white font-medium disabled:opacity-50 transition-all hover:shadow-md disabled:hover:shadow-none focus:ring-2 focus:ring-purple-500 focus:ring-offset-2"
           >
             {isPending ? <Loader2 className="w-4 h-4 animate-spin" /> : <BookOpen className="w-4 h-4" />}
             解説する
@@ -388,7 +450,7 @@ export default function HomePage() {
           <button
             onClick={() => handleSubmit("review")}
             disabled={!canSubmit}
-            className="flex items-center gap-2 px-6 py-3 rounded-lg border font-medium disabled:opacity-50 transition-all hover:shadow-md disabled:hover:shadow-none hover:bg-gray-50"
+            className="flex items-center gap-2 px-6 py-3 rounded-lg border font-medium disabled:opacity-50 transition-all hover:shadow-md disabled:hover:shadow-none hover:bg-gray-50 focus:ring-2 focus:ring-purple-500 focus:ring-offset-2"
             style={{
               borderColor: "var(--border)",
               color: "var(--foreground)",
@@ -402,8 +464,10 @@ export default function HomePage() {
 
         {/* Performance indicators in development */}
         {process.env.NODE_ENV === 'development' && (
-          <div className="mt-8 p-4 bg-gray-50 rounded-lg text-xs text-gray-600">
+          <div className="mt-8 p-4 bg-gray-50 rounded-lg text-xs text-gray-600 space-y-2">
             <p>🔧 開発モード: パフォーマンス測定有効</p>
+            <p>📊 コード行数: {code.split('\n').length.toLocaleString()}</p>
+            <p>💾 キャッシュ有効範囲: GitHub API (5分), 静的リソース (1年)</p>
           </div>
         )}
       </main>
