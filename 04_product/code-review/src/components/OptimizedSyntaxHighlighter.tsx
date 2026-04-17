@@ -1,228 +1,305 @@
 "use client";
 
-import { memo, useMemo, Suspense } from "react";
-import { Light as SyntaxHighlighter } from "react-syntax-highlighter";
-import { oneLight } from "react-syntax-highlighter/dist/esm/styles/hljs";
-import { getVisibleRange, globalCache } from "@/lib/performance";
-import { useVirtualScroll } from "@/lib/hooks/useVirtualScroll";
-
-// 必要な言語のみを動的に読み込み
-const loadLanguage = async (language: string) => {
-  const langMap: Record<string, () => Promise<any>> = {
-    javascript: () => import("react-syntax-highlighter/dist/esm/languages/hljs/javascript"),
-    typescript: () => import("react-syntax-highlighter/dist/esm/languages/hljs/typescript"),
-    python: () => import("react-syntax-highlighter/dist/esm/languages/hljs/python"),
-    go: () => import("react-syntax-highlighter/dist/esm/languages/hljs/go"),
-    rust: () => import("react-syntax-highlighter/dist/esm/languages/hljs/rust"),
-    java: () => import("react-syntax-highlighter/dist/esm/languages/hljs/java"),
-    cpp: () => import("react-syntax-highlighter/dist/esm/languages/hljs/cpp"),
-    php: () => import("react-syntax-highlighter/dist/esm/languages/hljs/php"),
-    ruby: () => import("react-syntax-highlighter/dist/esm/languages/hljs/ruby"),
-  };
-
-  const loader = langMap[language];
-  if (loader) {
-    const lang = await loader();
-    SyntaxHighlighter.registerLanguage(language, lang.default);
-  }
-};
+import { memo, useState, useEffect, useMemo, useCallback } from "react";
+import { globalCache, PerformanceMonitor } from "@/lib/performance";
 
 interface OptimizedSyntaxHighlighterProps {
   code: string;
   language: string;
   highlightLine?: number | null;
   className?: string;
+  maxLines?: number; // Virtual Scrolling用
 }
 
-const LOADING_SKELETON = (
-  <div className="h-full bg-gray-50 animate-pulse rounded-lg border flex items-center justify-center">
-    <div className="text-sm text-gray-500">コードを読み込み中...</div>
-  </div>
-);
-
-// メモ化されたコード行コンポーネント
-const CodeLine = memo(({ 
-  line, 
-  lineNumber, 
-  isHighlighted, 
-  language 
-}: { 
-  line: string; 
-  lineNumber: number; 
-  isHighlighted: boolean; 
-  language: string;
+// 軽量版のシンタックスハイライター（初期表示用）
+const LightSyntaxHighlighter = memo(({ code, highlightLine }: {
+  code: string;
+  highlightLine?: number | null;
 }) => {
-  const cacheKey = `code-line-${language}-${lineNumber}-${line.slice(0, 50)}`;
+  const lines = useMemo(() => code.split('\n'), [code]);
   
-  return useMemo(() => (
-    <div 
-      className={`
-        relative px-4 py-1 border-l-2 transition-all duration-300
-        ${isHighlighted 
-          ? 'bg-yellow-100 border-yellow-400 shadow-sm' 
-          : 'border-transparent'
-        }
-      `}
-      data-line={lineNumber}
-    >
-      <span className="absolute left-2 top-1 text-xs text-gray-400 select-none w-6">
-        {lineNumber}
-      </span>
-      <pre className="ml-8 font-mono text-sm overflow-x-auto">
-        <code>{line}</code>
-      </pre>
+  return (
+    <div className="font-mono text-sm">
+      {lines.map((line, i) => (
+        <div
+          key={i}
+          className={`px-4 py-0.5 hover:bg-gray-50 ${
+            highlightLine === i + 1 
+              ? 'bg-yellow-100 border-l-4 border-yellow-500' 
+              : ''
+          }`}
+          style={{ 
+            minHeight: '20px',
+            backgroundColor: highlightLine === i + 1 ? '#fef3c7' : undefined
+          }}
+        >
+          <span className="text-gray-400 mr-4 select-none w-8 inline-block text-right">
+            {i + 1}
+          </span>
+          <span>{line || ' '}</span>
+        </div>
+      ))}
     </div>
-  ), [line, lineNumber, isHighlighted, cacheKey]);
+  );
 });
+LightSyntaxHighlighter.displayName = 'LightSyntaxHighlighter';
 
-CodeLine.displayName = "CodeLine";
+// 重いライブラリの遅延読み込み
+let ReactSyntaxHighlighter: any = null;
+let prismStyles: any = null;
 
-// バーチャルスクロール対応のシンタックスハイライター
+const loadSyntaxHighlighter = async () => {
+  PerformanceMonitor.mark('syntax-highlighter-import-start');
+  
+  const cacheKey = 'syntax-highlighter-module';
+  const cached = globalCache.get(cacheKey);
+  if (cached) return cached;
+
+  try {
+    const [highlighterModule, stylesModule] = await Promise.all([
+      import('react-syntax-highlighter').then(mod => mod.Prism),
+      import('react-syntax-highlighter/dist/esm/styles/prism/vs').then(mod => mod.default)
+    ]);
+
+    ReactSyntaxHighlighter = highlighterModule;
+    prismStyles = stylesModule;
+
+    const result = { ReactSyntaxHighlighter, prismStyles };
+    globalCache.set(cacheKey, result);
+    
+    PerformanceMonitor.measure('syntax-highlighter-import-complete', 'syntax-highlighter-import-start');
+    return result;
+    
+  } catch (error) {
+    console.error('Failed to load syntax highlighter:', error);
+    return null;
+  }
+};
+
 export const OptimizedSyntaxHighlighter = memo<OptimizedSyntaxHighlighterProps>(({
   code,
   language,
   highlightLine,
-  className = "",
+  className,
+  maxLines = 1000
 }) => {
-  const lines = useMemo(() => code.split('\n'), [code]);
-  const totalLines = lines.length;
+  const [isLoaded, setIsLoaded] = useState(false);
+  const [isVisible, setIsVisible] = useState(false);
 
-  // 大きなファイルの場合はバーチャルスクロールを使用
-  const shouldUseVirtual = totalLines > 100;
+  // Intersection Observer で可視領域に入ったら重いライブラリを読み込み
+  useEffect(() => {
+    const observer = new IntersectionObserver(
+      ([entry]) => {
+        if (entry.isIntersecting) {
+          setIsVisible(true);
+          observer.disconnect();
+        }
+      },
+      { rootMargin: '100px' } // 少し手前で読み込み開始
+    );
 
-  const { 
-    containerRef, 
-    visibleRange, 
-    scrollToLine,
-    containerHeight 
-  } = useVirtualScroll({
-    totalItems: totalLines,
-    itemHeight: 24,
-    enabled: shouldUseVirtual,
-  });
+    const element = document.getElementById('syntax-highlighter-container');
+    if (element) observer.observe(element);
 
-  // 言語の動的読み込み
-  useMemo(() => {
-    if (language && language !== 'text') {
-      loadLanguage(language).catch(console.warn);
+    return () => observer.disconnect();
+  }, []);
+
+  // 可視領域に入ったらライブラリを読み込み
+  useEffect(() => {
+    if (isVisible && !isLoaded) {
+      loadSyntaxHighlighter().then((result) => {
+        if (result) {
+          setIsLoaded(true);
+        }
+      });
     }
-  }, [language]);
+  }, [isVisible, isLoaded]);
 
-  // ハイライト行への自動スクロール
-  useMemo(() => {
-    if (highlightLine && scrollToLine) {
-      const timer = setTimeout(() => {
-        scrollToLine(highlightLine - 1);
-      }, 100);
+  // ハイライト行への自動スクロール（デバウンス付き）
+  const scrollToHighlight = useCallback(() => {
+    if (highlightLine) {
+      const element = document.querySelector(`[data-line-number="${highlightLine}"]`);
+      if (element) {
+        element.scrollIntoView({ 
+          behavior: 'smooth', 
+          block: 'center' 
+        });
+      }
+    }
+  }, [highlightLine]);
+
+  useEffect(() => {
+    if (highlightLine) {
+      const timer = setTimeout(scrollToHighlight, 100);
       return () => clearTimeout(timer);
     }
-  }, [highlightLine, scrollToLine]);
+  }, [highlightLine, scrollToHighlight]);
 
-  // 軽量表示（バーチャルスクロール使用時）
-  const renderVirtualized = () => {
-    if (!visibleRange) return null;
+  // 大きなファイルの場合は Virtual Scrolling を適用
+  const shouldUseVirtualScrolling = useMemo(() => {
+    return code.split('\n').length > maxLines;
+  }, [code, maxLines]);
 
-    const { start, end } = visibleRange;
-    const visibleLines = lines.slice(start, end);
-    const paddingTop = start * 24;
-    const paddingBottom = (totalLines - end) * 24;
-
+  if (shouldUseVirtualScrolling) {
     return (
-      <div 
-        ref={containerRef}
-        className={`h-full overflow-y-auto border rounded-lg ${className}`}
-        style={{ 
-          background: "var(--surface)",
-          borderColor: "var(--border)" 
+      <VirtualizedCodeViewer
+        code={code}
+        highlightLine={highlightLine}
+        className={className}
+      />
+    );
+  }
+
+  if (!isLoaded) {
+    return (
+      <div id="syntax-highlighter-container" className={`overflow-auto ${className}`}>
+        <LightSyntaxHighlighter 
+          code={code} 
+          highlightLine={highlightLine}
+        />
+        {isVisible && (
+          <div className="absolute top-4 right-4 text-xs text-gray-500">
+            シンタックスハイライトを読み込み中...
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  if (!ReactSyntaxHighlighter || !prismStyles) {
+    return (
+      <div className={`overflow-auto ${className}`}>
+        <LightSyntaxHighlighter 
+          code={code} 
+          highlightLine={highlightLine}
+        />
+      </div>
+    );
+  }
+
+  // カスタムスタイル（ハイライト行対応）
+  const customStyle = useMemo(() => ({
+    ...prismStyles,
+    padding: '0',
+    margin: '0',
+    background: 'transparent',
+    fontSize: '14px',
+    lineHeight: '20px',
+  }), []);
+
+  // 行番号付きレンダラー
+  const lineProps = useCallback((lineNumber: number) => ({
+    style: {
+      backgroundColor: highlightLine === lineNumber 
+        ? 'rgba(250, 204, 21, 0.2)' 
+        : 'transparent',
+      borderLeft: highlightLine === lineNumber 
+        ? '4px solid rgb(250, 204, 21)' 
+        : '4px solid transparent',
+      paddingLeft: '12px',
+      display: 'block',
+      minHeight: '20px',
+    },
+    'data-line-number': lineNumber,
+  }), [highlightLine]);
+
+  return (
+    <div className={`overflow-auto ${className}`}>
+      <ReactSyntaxHighlighter
+        language={language}
+        style={customStyle}
+        showLineNumbers={true}
+        lineNumberStyle={{ 
+          minWidth: '40px', 
+          paddingRight: '16px',
+          color: '#9ca3af',
+          textAlign: 'right',
+          userSelect: 'none'
+        }}
+        lineProps={lineProps}
+        customStyle={{
+          background: 'transparent',
+          padding: '16px 0',
+        }}
+        codeTagProps={{
+          style: { fontFamily: 'var(--font-mono)' }
         }}
       >
-        <div style={{ paddingTop, paddingBottom }}>
-          {visibleLines.map((line, index) => {
-            const lineNumber = start + index + 1;
+        {code}
+      </ReactSyntaxHighlighter>
+    </div>
+  );
+});
+
+OptimizedSyntaxHighlighter.displayName = 'OptimizedSyntaxHighlighter';
+
+// Virtual Scrolling対応版（大きなファイル用）
+const VirtualizedCodeViewer = memo(({ 
+  code, 
+  highlightLine, 
+  className 
+}: {
+  code: string;
+  highlightLine?: number | null;
+  className?: string;
+}) => {
+  const lines = useMemo(() => code.split('\n'), [code]);
+  const [visibleRange, setVisibleRange] = useState({ start: 0, end: 50 });
+  const [containerHeight, setContainerHeight] = useState(400);
+
+  const handleScroll = useCallback((e: React.UIEvent<HTMLDivElement>) => {
+    const { scrollTop, clientHeight } = e.currentTarget;
+    const lineHeight = 20;
+    const start = Math.max(0, Math.floor(scrollTop / lineHeight) - 10);
+    const visible = Math.ceil(clientHeight / lineHeight);
+    const end = Math.min(lines.length, start + visible + 20);
+    
+    setVisibleRange({ start, end });
+    setContainerHeight(clientHeight);
+  }, [lines.length]);
+
+  const visibleLines = useMemo(() => {
+    return lines.slice(visibleRange.start, visibleRange.end);
+  }, [lines, visibleRange]);
+
+  const totalHeight = lines.length * 20;
+  const offsetY = visibleRange.start * 20;
+
+  return (
+    <div 
+      className={`overflow-auto font-mono text-sm ${className}`}
+      onScroll={handleScroll}
+      style={{ height: '100%' }}
+    >
+      <div style={{ height: totalHeight, position: 'relative' }}>
+        <div style={{ transform: `translateY(${offsetY}px)` }}>
+          {visibleLines.map((line, i) => {
+            const lineNumber = visibleRange.start + i + 1;
             return (
-              <CodeLine
+              <div
                 key={lineNumber}
-                line={line}
-                lineNumber={lineNumber}
-                isHighlighted={highlightLine === lineNumber}
-                language={language}
-              />
+                className={`px-4 py-0.5 hover:bg-gray-50 ${
+                  highlightLine === lineNumber 
+                    ? 'bg-yellow-100 border-l-4 border-yellow-500' 
+                    : ''
+                }`}
+                style={{ 
+                  height: '20px',
+                  backgroundColor: highlightLine === lineNumber ? '#fef3c7' : undefined
+                }}
+                data-line-number={lineNumber}
+              >
+                <span className="text-gray-400 mr-4 select-none w-8 inline-block text-right">
+                  {lineNumber}
+                </span>
+                <span>{line || ' '}</span>
+              </div>
             );
           })}
         </div>
       </div>
-    );
-  };
-
-  // 通常表示（小さなファイル用）
-  const renderNormal = () => {
-    const cacheKey = `syntax-${language}-${code.slice(0, 100)}`;
-    const cached = globalCache.get(cacheKey);
-    
-    if (cached && Date.now() - cached.timestamp < 300000) {
-      return (
-        <div className={`h-full overflow-y-auto ${className}`}>
-          <div dangerouslySetInnerHTML={{ __html: cached.html }} />
-        </div>
-      );
-    }
-
-    return (
-      <div className={`h-full overflow-y-auto ${className}`}>
-        <SyntaxHighlighter
-          language={language}
-          style={oneLight}
-          showLineNumbers={true}
-          lineNumberStyle={{ 
-            color: '#9ca3af', 
-            fontSize: '12px',
-            paddingRight: '16px',
-            userSelect: 'none',
-            minWidth: '32px'
-          }}
-          customStyle={{
-            margin: 0,
-            padding: '16px',
-            background: 'var(--surface)',
-            fontSize: '14px',
-            lineHeight: '1.5',
-            border: '1px solid var(--border)',
-            borderRadius: '8px',
-          }}
-          wrapLines={true}
-          lineProps={(lineNumber) => ({
-            style: {
-              display: 'block',
-              backgroundColor: highlightLine === lineNumber 
-                ? 'rgba(251, 191, 36, 0.2)' 
-                : 'transparent',
-              borderLeft: highlightLine === lineNumber 
-                ? '3px solid #fbbf24' 
-                : '3px solid transparent',
-              paddingLeft: '8px',
-              transition: 'all 0.3s ease',
-            }
-          })}
-        >
-          {code}
-        </SyntaxHighlighter>
-      </div>
-    );
-  };
-
-  if (shouldUseVirtual) {
-    return (
-      <Suspense fallback={LOADING_SKELETON}>
-        {renderVirtualized()}
-      </Suspense>
-    );
-  }
-
-  return (
-    <Suspense fallback={LOADING_SKELETON}>
-      {renderNormal()}
-    </Suspense>
+    </div>
   );
 });
 
-OptimizedSyntaxHighlighter.displayName = "OptimizedSyntaxHighlighter";
+VirtualizedCodeViewer.displayName = 'VirtualizedCodeViewer';
