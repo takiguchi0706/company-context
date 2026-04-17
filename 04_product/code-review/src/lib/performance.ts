@@ -1,133 +1,89 @@
-// Performance optimization utilities
-
-import { useState, useCallback, useMemo } from 'react';
-
 /**
- * デバウンス処理用のカスタムフック
- * 連続したユーザー入力を制御してパフォーマンスを向上
+ * パフォーマンス最適化ユーティリティ
  */
+
+// グローバルキャッシュ
+export const globalCache = new Map<string, any>();
+
+// キャッシュクリーンアップ（メモリ制限）
+const MAX_CACHE_SIZE = 100;
+let cacheCleanupTimer: NodeJS.Timeout | null = null;
+
+function cleanupCache() {
+  if (globalCache.size > MAX_CACHE_SIZE) {
+    const keys = Array.from(globalCache.keys());
+    const keysToDelete = keys.slice(0, keys.length - MAX_CACHE_SIZE + 20);
+    keysToDelete.forEach(key => globalCache.delete(key));
+  }
+}
+
+// デバウンス関数
 export function useDebounce<T extends (...args: any[]) => any>(
-  callback: T,
+  func: T,
   delay: number
+): (...args: Parameters<T>) => void {
+  let timeoutId: NodeJS.Timeout;
+  
+  return (...args: Parameters<T>) => {
+    clearTimeout(timeoutId);
+    timeoutId = setTimeout(() => func(...args), delay);
+  };
+}
+
+// コンポーネントレベルキャッシュ
+export function withCache<T>(
+  key: string,
+  generator: () => T,
+  ttl: number = 300000 // 5分
 ): T {
-  const [timeoutId, setTimeoutId] = useState<NodeJS.Timeout | null>(null);
-
-  return useCallback(
-    ((...args: Parameters<T>) => {
-      if (timeoutId) {
-        clearTimeout(timeoutId);
-      }
-      
-      const newTimeoutId = setTimeout(() => {
-        callback(...args);
-      }, delay);
-      
-      setTimeoutId(newTimeoutId);
-    }) as T,
-    [callback, delay, timeoutId]
-  );
-}
-
-/**
- * 重いコード処理をWeb Worker風に分割実行
- * UIブロッキングを防ぐ
- */
-export function processInChunks<T>(
-  items: T[],
-  processor: (item: T) => void,
-  chunkSize: number = 100
-): Promise<void> {
-  return new Promise((resolve) => {
-    let index = 0;
-    
-    function processChunk() {
-      const endIndex = Math.min(index + chunkSize, items.length);
-      
-      for (let i = index; i < endIndex; i++) {
-        processor(items[i]);
-      }
-      
-      index = endIndex;
-      
-      if (index < items.length) {
-        // 次のチャンクを非同期で処理
-        setTimeout(processChunk, 0);
-      } else {
-        resolve();
-      }
-    }
-    
-    processChunk();
+  const cacheKey = `cache_${key}`;
+  const cached = globalCache.get(cacheKey);
+  
+  if (cached && Date.now() - cached.timestamp < ttl) {
+    return cached.value;
+  }
+  
+  const value = generator();
+  globalCache.set(cacheKey, {
+    value,
+    timestamp: Date.now()
   });
+  
+  // 定期クリーンアップ
+  if (cacheCleanupTimer) clearTimeout(cacheCleanupTimer);
+  cacheCleanupTimer = setTimeout(cleanupCache, 30000);
+  
+  return value;
 }
 
-/**
- * コード行の仮想化処理
- * 大きなファイルでも高速表示
- */
-export function useVirtualizedLines(
-  content: string,
-  containerHeight: number,
-  lineHeight: number = 20
+// 遅延読み込み
+export function createLazyComponent<P = {}>(
+  importFunc: () => Promise<{ default: React.ComponentType<P> }>
 ) {
-  const lines = useMemo(() => content.split('\n'), [content]);
-  
-  const visibleCount = Math.ceil(containerHeight / lineHeight) + 5; // バッファ追加
-  
-  const getVisibleLines = useCallback((scrollTop: number) => {
-    const startIndex = Math.floor(scrollTop / lineHeight);
-    const endIndex = Math.min(startIndex + visibleCount, lines.length);
-    
-    return {
-      startIndex,
-      endIndex,
-      visibleLines: lines.slice(startIndex, endIndex),
-      totalHeight: lines.length * lineHeight,
-    };
-  }, [lines, lineHeight, visibleCount]);
-  
-  return { getVisibleLines, totalLines: lines.length };
+  return React.lazy(importFunc);
 }
 
-/**
- * LRUキャッシュ実装
- * API結果やレンダリング結果をキャッシュ
- */
-export class LRUCache<K, V> {
-  private cache = new Map<K, V>();
-  private maxSize: number;
-
-  constructor(maxSize: number = 50) {
-    this.maxSize = maxSize;
-  }
-
-  get(key: K): V | undefined {
-    const value = this.cache.get(key);
-    if (value !== undefined) {
-      // アクセスされた項目を最新に移動
-      this.cache.delete(key);
-      this.cache.set(key, value);
-    }
-    return value;
-  }
-
-  set(key: K, value: V): void {
-    if (this.cache.has(key)) {
-      this.cache.delete(key);
-    } else if (this.cache.size >= this.maxSize) {
-      // 最も古い項目を削除
-      const firstKey = this.cache.keys().next().value;
-      this.cache.delete(firstKey);
-    }
-    this.cache.set(key, value);
-  }
-
-  clear(): void {
-    this.cache.clear();
+// プリロード
+export function preloadRoute(href: string) {
+  if (typeof window !== 'undefined') {
+    const link = document.createElement('link');
+    link.rel = 'prefetch';
+    link.href = href;
+    document.head.appendChild(link);
   }
 }
 
-/**
- * グローバルキャッシュインスタンス
- */
-export const globalCache = new LRUCache<string, any>(100);
+// Virtual Scrolling用ヘルパー
+export function getVisibleRange(
+  containerHeight: number,
+  itemHeight: number,
+  scrollTop: number,
+  totalItems: number,
+  buffer: number = 5
+) {
+  const start = Math.max(0, Math.floor(scrollTop / itemHeight) - buffer);
+  const visible = Math.ceil(containerHeight / itemHeight);
+  const end = Math.min(totalItems, start + visible + buffer * 2);
+  
+  return { start, end, visible };
+}
