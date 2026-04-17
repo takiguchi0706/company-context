@@ -11,7 +11,7 @@ import {
   Loader2,
   ChevronDown,
 } from "lucide-react";
-import { CodeJumpMarkdown } from "@/components/CodeJumpMarkdown";
+import { LazyCodeJumpMarkdown } from "@/components/LazyCodeJumpMarkdown";
 import { OptimizedSyntaxHighlighter } from "@/components/OptimizedSyntaxHighlighter";
 import { useDebounce, globalCache } from "@/lib/performance";
 
@@ -182,7 +182,7 @@ export default function ExplainPage() {
     const explanationCacheKey = `explanation-${req.code.slice(0, 100)}-${req.level}-${req.mode}`;
     const cachedExplanation = globalCache.get(explanationCacheKey);
     
-    if (cachedExplanation) {
+    if (cachedExplanation && Date.now() - cachedExplanation.timestamp < 300000) {
       setExplanation(cachedExplanation.explanation);
       setMeta(cachedExplanation.meta);
       setLoading(false);
@@ -238,7 +238,8 @@ export default function ExplainPage() {
           output_tokens: data.output_tokens,
           cost_usd: data.cost_usd,
           elapsed_ms: data.elapsed_ms,
-        }
+        },
+        timestamp: Date.now(),
       };
       
       setExplanation(result.explanation);
@@ -292,9 +293,13 @@ export default function ExplainPage() {
 
   const handleCopy = useCallback(async () => {
     if (!explanation) return;
-    await navigator.clipboard.writeText(explanation);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 2000);
+    try {
+      await navigator.clipboard.writeText(explanation);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch (error) {
+      console.error('Copy failed:', error);
+    }
   }, [explanation]);
 
   async function handleSendQuestion() {
@@ -341,7 +346,10 @@ export default function ExplainPage() {
       ]);
     } finally {
       setChatLoading(false);
-      setTimeout(() => questionInputRef.current?.focus(), 100);
+      // フォーカスを非同期で設定
+      requestAnimationFrame(() => {
+        questionInputRef.current?.focus();
+      });
     }
   }
 
@@ -504,7 +512,7 @@ export default function ExplainPage() {
 
             {explanation && (
               <div className="prose max-w-none">
-                <CodeJumpMarkdown
+                <LazyCodeJumpMarkdown
                   markdown={explanation}
                   onCodeClick={jumpToCode}
                 />
@@ -538,7 +546,7 @@ export default function ExplainPage() {
                         className="prose max-w-none p-4 rounded-2xl rounded-tl-sm text-sm w-full"
                         style={{ background: "var(--surface)" }}
                       >
-                        <CodeJumpMarkdown
+                        <LazyCodeJumpMarkdown
                           markdown={msg.content}
                           onCodeClick={jumpToCode}
                         />
