@@ -2,8 +2,6 @@
 
 import { useState, useEffect, useRef, useCallback } from "react";
 import { useRouter } from "next/navigation";
-import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
-import { atomDark } from "react-syntax-highlighter/dist/esm/styles/prism";
 import {
   BookOpen,
   RotateCcw,
@@ -14,6 +12,8 @@ import {
   ChevronDown,
 } from "lucide-react";
 import { CodeJumpMarkdown } from "@/components/CodeJumpMarkdown";
+import { OptimizedSyntaxHighlighter } from "@/components/OptimizedSyntaxHighlighter";
+import { useDebounce, globalCache } from "@/lib/performance";
 
 interface ReviewRequest {
   code: string;
@@ -70,9 +70,17 @@ function findMatchingLines(sourceCode: string, snippet: string): number[] {
   const trimmed = snippet.trim();
   if (!trimmed || trimmed.length < 2) return [];
 
+  // キャッシュから取得を試行
+  const cacheKey = `match-${sourceCode.slice(0, 50)}-${trimmed.slice(0, 30)}`;
+  const cached = globalCache.get(cacheKey);
+  if (cached) return cached;
+
   // Step 1: 完全一致
   const exact = allLineOccurrences(sourceCode, trimmed);
-  if (exact.length > 0) return exact;
+  if (exact.length > 0) {
+    globalCache.set(cacheKey, exact);
+    return exact;
+  }
 
   const srcLines = sourceCode.split("\n");
   const normSrcLines = srcLines.map(normalizeWS);
@@ -86,7 +94,10 @@ function findMatchingLines(sourceCode: string, snippet: string): number[] {
   for (const line of candidateLines) {
     // Step 2: そのまま substring match
     const direct = allLineOccurrences(sourceCode, line);
-    if (direct.length > 0) return direct;
+    if (direct.length > 0) {
+      globalCache.set(cacheKey, direct);
+      return direct;
+    }
 
     // Step 3: 空白正規化
     const normLine = normalizeWS(line);
@@ -94,7 +105,10 @@ function findMatchingLines(sourceCode: string, snippet: string): number[] {
       if (srcLine === normLine || srcLine.includes(normLine)) acc.push(i + 1);
       return acc;
     }, []);
-    if (normMatches.length > 0) return normMatches;
+    if (normMatches.length > 0) {
+      globalCache.set(cacheKey, normMatches);
+      return normMatches;
+    }
   }
 
   // Step 4: 最長識別子で \b正規表現マッチ
@@ -107,10 +121,16 @@ function findMatchingLines(sourceCode: string, snippet: string): number[] {
     while ((m = regex.exec(sourceCode)) !== null) {
       lineNums.push(sourceCode.slice(0, m.index).split("\n").length);
     }
-    if (lineNums.length > 0) return [...new Set(lineNums)];
+    if (lineNums.length > 0) {
+      const result = [...new Set(lineNums)];
+      globalCache.set(cacheKey, result);
+      return result;
+    }
   }
 
-  return [];
+  const emptyResult: number[] = [];
+  globalCache.set(cacheKey, emptyResult);
+  return emptyResult;
 }
 
 export default function ExplainPage() {
@@ -134,7 +154,6 @@ export default function ExplainPage() {
   // コードジャンプ用
   const [highlightLine, setHighlightLine] = useState<number | null>(null);
   const [notFoundFlash, setNotFoundFlash] = useState(false);
-  const codeViewerRef = useRef<HTMLDivElement>(null);
   const highlightTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const notFoundTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // 連続クリックで次のマッチへ進むための状態
@@ -146,6 +165,9 @@ export default function ExplainPage() {
   const chatBottomRef = useRef<HTMLDivElement>(null);
   const questionInputRef = useRef<HTMLInputElement>(null);
 
+  // デバウンスされた質問送信
+  const debouncedSendQuestion = useDebounce(handleSendQuestion, 300);
+
   // sessionStorage からリクエストを読み込み
   useEffect(() => {
     const stored = sessionStorage.getItem("review-request");
@@ -155,13 +177,27 @@ export default function ExplainPage() {
     }
     const req = JSON.parse(stored) as ReviewRequest;
     setRequest(req);
-    generateExplanation(req);
+    
+    // 解説のキャッシュを確認
+    const explanationCacheKey = `explanation-${req.code.slice(0, 100)}-${req.level}-${req.mode}`;
+    const cachedExplanation = globalCache.get(explanationCacheKey);
+    
+    if (cachedExplanation) {
+      setExplanation(cachedExplanation.explanation);
+      setMeta(cachedExplanation.meta);
+      setLoading(false);
+    } else {
+      generateExplanation(req);
+    }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // チャット履歴が増えたら末尾にスクロール
+  // チャット履歴が増えたら末尾にスクロール（デバウンス）
   useEffect(() => {
-    chatBottomRef.current?.scrollIntoView({ behavior: "smooth" });
+    const timer = setTimeout(() => {
+      chatBottomRef.current?.scrollIntoView({ behavior: "smooth" });
+    }, 100);
+    return () => clearTimeout(timer);
   }, [chatHistory, explanation]);
 
   // アンマウント時にタイマーをクリア
@@ -175,6 +211,9 @@ export default function ExplainPage() {
   async function generateExplanation(req: ReviewRequest) {
     setLoading(true);
     setError("");
+    
+    const explanationCacheKey = `explanation-${req.code.slice(0, 100)}-${req.level}-${req.mode}`;
+    
     try {
       const res = await fetch("/api/review", {
         method: "POST",
@@ -191,13 +230,23 @@ export default function ExplainPage() {
         setError(data.error ?? "解説の生成に失敗しました");
         return;
       }
-      setExplanation(data.explanation);
-      setMeta({
-        input_tokens: data.input_tokens,
-        output_tokens: data.output_tokens,
-        cost_usd: data.cost_usd,
-        elapsed_ms: data.elapsed_ms,
-      });
+      
+      const result = {
+        explanation: data.explanation,
+        meta: {
+          input_tokens: data.input_tokens,
+          output_tokens: data.output_tokens,
+          cost_usd: data.cost_usd,
+          elapsed_ms: data.elapsed_ms,
+        }
+      };
+      
+      setExplanation(result.explanation);
+      setMeta(result.meta);
+      
+      // 結果をキャッシュ
+      globalCache.set(explanationCacheKey, result);
+      
     } catch {
       setError("ネットワークエラーが発生しました");
     } finally {
@@ -235,12 +284,6 @@ export default function ExplainPage() {
 
       requestAnimationFrame(() => {
         setHighlightLine(lineNum);
-
-        const el = codeViewerRef.current?.querySelector(`[data-line="${lineNum}"]`);
-        if (el) {
-          el.scrollIntoView({ behavior: "smooth", block: "center" });
-        }
-
         highlightTimerRef.current = setTimeout(() => setHighlightLine(null), 2500);
       });
     },
@@ -248,12 +291,13 @@ export default function ExplainPage() {
   );
 
   const handleCopy = useCallback(async () => {
+    if (!explanation) return;
     await navigator.clipboard.writeText(explanation);
     setCopied(true);
     setTimeout(() => setCopied(false), 2000);
   }, [explanation]);
 
-  const handleSendQuestion = useCallback(async () => {
+  async function handleSendQuestion() {
     if (!question.trim() || chatLoading || !request) return;
 
     const userQuestion = question.trim();
@@ -299,7 +343,18 @@ export default function ExplainPage() {
       setChatLoading(false);
       setTimeout(() => questionInputRef.current?.focus(), 100);
     }
-  }, [question, chatLoading, request, chatHistory]);
+  }
+
+  const handleQuestionChange = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
+    setQuestion(e.target.value);
+  }, []);
+
+  const handleKeyDown = useCallback((e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      debouncedSendQuestion();
+    }
+  }, [debouncedSendQuestion]);
 
   if (!request) return null;
 
@@ -392,43 +447,14 @@ export default function ExplainPage() {
               )}
             </span>
           </div>
-          {/* ref を付与してジャンプ対象の行を querySelector で探す */}
-          <div ref={codeViewerRef} className="flex-1 overflow-auto">
-            <SyntaxHighlighter
+          
+          <div className="flex-1 overflow-hidden">
+            <OptimizedSyntaxHighlighter
+              code={request.code}
               language={syntaxLang}
-              style={atomDark}
-              showLineNumbers
-              wrapLines
-              lineProps={(lineNum) =>
-                ({
-                  "data-line": String(lineNum),
-                  style: {
-                    display: "block",
-                    paddingLeft: "4px",
-                    marginLeft: "-4px",
-                    borderLeft: lineNum === highlightLine
-                      ? "3px solid #facc15"
-                      : "3px solid transparent",
-                    background: lineNum === highlightLine
-                      ? "rgba(250,204,21,0.18)"
-                      : undefined,
-                    animation: lineNum === highlightLine
-                      ? "highlightFade 2.5s ease forwards"
-                      : undefined,
-                    transition: "background 0.3s, border-color 0.3s",
-                  },
-                } as React.HTMLProps<HTMLElement>)
-              }
-              wrapLongLines={false}
-              customStyle={{
-                margin: 0,
-                borderRadius: 0,
-                fontSize: "0.8125rem",
-                minHeight: "100%",
-              }}
-            >
-              {request.code}
-            </SyntaxHighlighter>
+              highlightLine={highlightLine}
+              className="h-full"
+            />
           </div>
         </div>
 
@@ -542,8 +568,8 @@ export default function ExplainPage() {
                 ref={questionInputRef}
                 type="text"
                 value={question}
-                onChange={(e) => setQuestion(e.target.value)}
-                onKeyDown={(e) => e.key === "Enter" && !e.shiftKey && handleSendQuestion()}
+                onChange={handleQuestionChange}
+                onKeyDown={handleKeyDown}
                 placeholder="このコードについて質問する..."
                 disabled={loading || chatLoading}
                 className="flex-1 px-3 py-2 rounded-lg border text-sm"
@@ -554,7 +580,7 @@ export default function ExplainPage() {
                 }}
               />
               <button
-                onClick={handleSendQuestion}
+                onClick={debouncedSendQuestion}
                 disabled={!question.trim() || loading || chatLoading}
                 className="px-3 py-2 rounded-lg gradient-bg text-white disabled:opacity-50 transition-opacity"
               >
