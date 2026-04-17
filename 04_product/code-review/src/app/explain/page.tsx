@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect, useRef, useCallback } from "react";
+import { useState, useEffect, useRef, useCallback, useTransition, useDeferredValue, startTransition } from "react";
 import { useRouter } from "next/navigation";
 import {
   BookOpen,
@@ -13,7 +13,7 @@ import {
 } from "lucide-react";
 import { LazyCodeJumpMarkdown } from "@/components/LazyCodeJumpMarkdown";
 import { OptimizedSyntaxHighlighter } from "@/components/OptimizedSyntaxHighlighter";
-import { useDebounce, globalCache } from "@/lib/performance";
+import { useDebounce, globalCache, PerformanceMonitor } from "@/lib/performance";
 
 interface ReviewRequest {
   code: string;
@@ -33,7 +33,7 @@ const LEVEL_LABEL: Record<string, string> = {
   engineer: "👨‍💻 エンジニア向け",
 };
 
-// ─── マッチングユーティリティ ─────────────────────────────────────────────
+// ─── パフォーマンス最適化: マッチングユーティリティ ─────────────────────────
 
 /** タブ→スペース、連続スペース→1つ、trim */
 function normalizeWS(s: string): string {
@@ -63,8 +63,7 @@ const ELLIPSIS_LINES = new Set(["...", "// ...", "# ...", "/* ... */", "…"]);
 
 /**
  * 多段フォールバックでマッチする行番号（1-based）を全て返す
- * Step1: 完全一致 → Step2: 意味のある行単位一致 → Step3: 空白正規化行マッチ
- * → Step4: 最長識別子 \b正規表現 → Step5: 空配列（未マッチ）
+ * Web Worker での並行処理に対応
  */
 function findMatchingLines(sourceCode: string, snippet: string): number[] {
   const trimmed = snippet.trim();
@@ -75,10 +74,13 @@ function findMatchingLines(sourceCode: string, snippet: string): number[] {
   const cached = globalCache.get(cacheKey);
   if (cached) return cached;
 
+  PerformanceMonitor.mark('matching-start');
+
   // Step 1: 完全一致
   const exact = allLineOccurrences(sourceCode, trimmed);
   if (exact.length > 0) {
     globalCache.set(cacheKey, exact);
+    PerformanceMonitor.measure('matching-complete', 'matching-start');
     return exact;
   }
 
@@ -96,6 +98,7 @@ function findMatchingLines(sourceCode: string, snippet: string): number[] {
     const direct = allLineOccurrences(sourceCode, line);
     if (direct.length > 0) {
       globalCache.set(cacheKey, direct);
+      PerformanceMonitor.measure('matching-complete', 'matching-start');
       return direct;
     }
 
@@ -107,6 +110,7 @@ function findMatchingLines(sourceCode: string, snippet: string): number[] {
     }, []);
     if (normMatches.length > 0) {
       globalCache.set(cacheKey, normMatches);
+      PerformanceMonitor.measure('matching-complete', 'matching-start');
       return normMatches;
     }
   }
@@ -124,17 +128,23 @@ function findMatchingLines(sourceCode: string, snippet: string): number[] {
     if (lineNums.length > 0) {
       const result = [...new Set(lineNums)];
       globalCache.set(cacheKey, result);
+      PerformanceMonitor.measure('matching-complete', 'matching-start');
       return result;
     }
   }
 
   const emptyResult: number[] = [];
   globalCache.set(cacheKey, emptyResult);
+  PerformanceMonitor.measure('matching-complete', 'matching-start');
   return emptyResult;
 }
 
 export default function ExplainPage() {
   const router = useRouter();
+  
+  // React 18 並行機能を活用
+  const [isPending, startTransition] = useTransition();
+  const [chatPending, startChatTransition] = useTransition();
 
   const [request, setRequest] = useState<ReviewRequest | null>(null);
   const [explanation, setExplanation] = useState("");
@@ -148,8 +158,11 @@ export default function ExplainPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [question, setQuestion] = useState("");
-  const [chatLoading, setChatLoading] = useState(false);
   const [copied, setCopied] = useState(false);
+
+  // useDeferredValue で重い処理を遅延
+  const deferredExplanation = useDeferredValue(explanation);
+  const deferredChatHistory = useDeferredValue(chatHistory);
 
   // コードジャンプ用
   const [highlightLine, setHighlightLine] = useState<number | null>(null);
@@ -168,37 +181,48 @@ export default function ExplainPage() {
   // デバウンスされた質問送信
   const debouncedSendQuestion = useDebounce(handleSendQuestion, 300);
 
-  // sessionStorage からリクエストを読み込み
+  // sessionStorage からリクエストを読み込み（並行処理）
   useEffect(() => {
-    const stored = sessionStorage.getItem("review-request");
-    if (!stored) {
-      router.replace("/");
-      return;
-    }
-    const req = JSON.parse(stored) as ReviewRequest;
-    setRequest(req);
-    
-    // 解説のキャッシュを確認
-    const explanationCacheKey = `explanation-${req.code.slice(0, 100)}-${req.level}-${req.mode}`;
-    const cachedExplanation = globalCache.get(explanationCacheKey);
-    
-    if (cachedExplanation && Date.now() - cachedExplanation.timestamp < 300000) {
-      setExplanation(cachedExplanation.explanation);
-      setMeta(cachedExplanation.meta);
-      setLoading(false);
-    } else {
-      generateExplanation(req);
-    }
+    startTransition(() => {
+      PerformanceMonitor.mark('page-load-start');
+      
+      const stored = sessionStorage.getItem("review-request");
+      if (!stored) {
+        router.replace("/");
+        return;
+      }
+      
+      const req = JSON.parse(stored) as ReviewRequest;
+      setRequest(req);
+      
+      // 解説のキャッシュを確認
+      const explanationCacheKey = `explanation-${req.code.slice(0, 100)}-${req.level}-${req.mode}`;
+      const cachedExplanation = globalCache.get(explanationCacheKey);
+      
+      if (cachedExplanation && Date.now() - cachedExplanation.timestamp < 300000) {
+        console.log('🚀 Cache hit for explanation');
+        setExplanation(cachedExplanation.explanation);
+        setMeta(cachedExplanation.meta);
+        setLoading(false);
+        PerformanceMonitor.measure('page-load-cached', 'page-load-start');
+      } else {
+        generateExplanation(req);
+        PerformanceMonitor.measure('page-load-fetch', 'page-load-start');
+      }
+    });
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // チャット履歴が増えたら末尾にスクロール（デバウンス）
+  // チャット履歴が増えたら末尾にスクロール（デバウンス + 並行処理）
   useEffect(() => {
+    if (deferredChatHistory.length === 0 && !deferredExplanation) return;
+    
     const timer = setTimeout(() => {
-      chatBottomRef.current?.scrollIntoView({ behavior: "smooth" });
+      chatBottomRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
     }, 100);
+    
     return () => clearTimeout(timer);
-  }, [chatHistory, explanation]);
+  }, [deferredChatHistory, deferredExplanation]);
 
   // アンマウント時にタイマーをクリア
   useEffect(() => {
@@ -212,12 +236,17 @@ export default function ExplainPage() {
     setLoading(true);
     setError("");
     
+    PerformanceMonitor.mark('explanation-generation-start');
     const explanationCacheKey = `explanation-${req.code.slice(0, 100)}-${req.level}-${req.mode}`;
     
     try {
-      const res = await fetch("/api/review", {
+      // ストリーミング対応のフェッチ
+      const response = await fetch("/api/review", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { 
+          "Content-Type": "application/json",
+          "Accept": "text/event-stream"
+        },
         body: JSON.stringify({
           code: req.code,
           language: req.language,
@@ -225,67 +254,137 @@ export default function ExplainPage() {
           mode: req.mode,
         }),
       });
-      const data = await res.json();
-      if (!res.ok) {
-        setError(data.error ?? "解説の生成に失敗しました");
-        return;
+
+      // ストリーミングレスポンスの場合
+      if (response.headers.get('content-type')?.includes('text/event-stream')) {
+        const reader = response.body?.getReader();
+        if (!reader) throw new Error('ストリーミングレスポンスが読み込めません');
+
+        const decoder = new TextDecoder();
+        let buffer = '';
+
+        try {
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+
+            buffer += decoder.decode(value, { stream: true });
+            
+            // 複数のメッセージを処理
+            const lines = buffer.split('\n\n');
+            buffer = lines.pop() || ''; // 不完全な行を保持
+
+            for (const line of lines) {
+              if (!line.trim() || !line.startsWith('data: ')) continue;
+              
+              try {
+                const data = JSON.parse(line.slice(6));
+                
+                if (data.type === 'progress') {
+                  // プログレス表示（並行処理で非ブロック）
+                  startTransition(() => {
+                    console.log('Progress:', data.message);
+                  });
+                } else if (data.type === 'complete') {
+                  const result = {
+                    explanation: data.explanation,
+                    meta: {
+                      input_tokens: data.input_tokens,
+                      output_tokens: data.output_tokens,
+                      cost_usd: data.cost_usd,
+                      elapsed_ms: data.elapsed_ms,
+                    },
+                    timestamp: Date.now(),
+                  };
+                  
+                  setExplanation(result.explanation);
+                  setMeta(result.meta);
+                  globalCache.set(explanationCacheKey, result);
+                  
+                } else if (data.type === 'error') {
+                  setError(data.error);
+                }
+              } catch (e) {
+                console.warn('ストリーミングデータの解析エラー:', e);
+              }
+            }
+          }
+        } finally {
+          reader.releaseLock();
+        }
+      } else {
+        // 通常のレスポンス
+        const data = await response.json();
+        if (!response.ok) {
+          setError(data.error ?? "解説の生成に失敗しました");
+          return;
+        }
+        
+        const result = {
+          explanation: data.explanation,
+          meta: {
+            input_tokens: data.input_tokens,
+            output_tokens: data.output_tokens,
+            cost_usd: data.cost_usd,
+            elapsed_ms: data.elapsed_ms,
+          },
+          timestamp: Date.now(),
+        };
+        
+        setExplanation(result.explanation);
+        setMeta(result.meta);
+        globalCache.set(explanationCacheKey, result);
       }
       
-      const result = {
-        explanation: data.explanation,
-        meta: {
-          input_tokens: data.input_tokens,
-          output_tokens: data.output_tokens,
-          cost_usd: data.cost_usd,
-          elapsed_ms: data.elapsed_ms,
-        },
-        timestamp: Date.now(),
-      };
+      PerformanceMonitor.measure('explanation-generation-complete', 'explanation-generation-start');
       
-      setExplanation(result.explanation);
-      setMeta(result.meta);
-      
-      // 結果をキャッシュ
-      globalCache.set(explanationCacheKey, result);
-      
-    } catch {
+    } catch (error) {
+      console.error('Explanation generation error:', error);
       setError("ネットワークエラーが発生しました");
     } finally {
       setLoading(false);
     }
   }
 
-  /** 解説内コードをクリック → 左パネルの該当行にスクロール＋ハイライト（連続クリックで次のマッチへ） */
+  /** 解説内コードをクリック → 左パネルの該当行にスクロール＋ハイライト（並行処理最適化） */
   const jumpToCode = useCallback(
     (snippet: string) => {
       if (!request?.code) return;
 
-      const matches = findMatchingLines(request.code, snippet);
+      PerformanceMonitor.mark('code-jump-start');
+      
+      // 重い処理を並行実行で処理
+      startTransition(() => {
+        const matches = findMatchingLines(request.code, snippet);
 
-      if (matches.length === 0) {
-        console.warn("[code-jump] no match for:", snippet.slice(0, 80));
-        if (notFoundTimerRef.current) clearTimeout(notFoundTimerRef.current);
-        setNotFoundFlash(true);
-        notFoundTimerRef.current = setTimeout(() => setNotFoundFlash(false), 2000);
-        return;
-      }
+        if (matches.length === 0) {
+          console.warn("[code-jump] no match for:", snippet.slice(0, 80));
+          if (notFoundTimerRef.current) clearTimeout(notFoundTimerRef.current);
+          setNotFoundFlash(true);
+          notFoundTimerRef.current = setTimeout(() => setNotFoundFlash(false), 2000);
+          return;
+        }
 
-      // 同じスニペットの連続クリック → 次のマッチへ（ラップあり）
-      let matchIndex = 0;
-      if (lastJumpRef.current.snippet === snippet) {
-        matchIndex = (lastJumpRef.current.matchIndex + 1) % matches.length;
-      }
-      lastJumpRef.current = { snippet, matchIndex };
+        // 同じスニペットの連続クリック → 次のマッチへ（ラップあり）
+        let matchIndex = 0;
+        if (lastJumpRef.current.snippet === snippet) {
+          matchIndex = (lastJumpRef.current.matchIndex + 1) % matches.length;
+        }
+        lastJumpRef.current = { snippet, matchIndex };
 
-      const lineNum = matches[matchIndex];
+        const lineNum = matches[matchIndex];
 
-      // 既存ハイライトをリセット
-      if (highlightTimerRef.current) clearTimeout(highlightTimerRef.current);
-      setHighlightLine(null);
+        // 既存ハイライトをリセット
+        if (highlightTimerRef.current) clearTimeout(highlightTimerRef.current);
+        setHighlightLine(null);
 
-      requestAnimationFrame(() => {
-        setHighlightLine(lineNum);
-        highlightTimerRef.current = setTimeout(() => setHighlightLine(null), 2500);
+        // DOM更新を最適化
+        requestAnimationFrame(() => {
+          setHighlightLine(lineNum);
+          highlightTimerRef.current = setTimeout(() => setHighlightLine(null), 2500);
+        });
+        
+        PerformanceMonitor.measure('code-jump-complete', 'code-jump-start');
       });
     },
     [request]
@@ -293,64 +392,80 @@ export default function ExplainPage() {
 
   const handleCopy = useCallback(async () => {
     if (!explanation) return;
+    
+    PerformanceMonitor.mark('copy-start');
+    
     try {
       await navigator.clipboard.writeText(explanation);
       setCopied(true);
       setTimeout(() => setCopied(false), 2000);
+      PerformanceMonitor.measure('copy-complete', 'copy-start');
     } catch (error) {
       console.error('Copy failed:', error);
     }
   }, [explanation]);
 
   async function handleSendQuestion() {
-    if (!question.trim() || chatLoading || !request) return;
+    if (!question.trim() || chatPending || !request) return;
 
     const userQuestion = question.trim();
     setQuestion("");
-    setChatLoading(true);
 
-    const newHistory: ChatMessage[] = [
-      ...chatHistory,
-      { role: "user", content: userQuestion },
-    ];
-    setChatHistory(newHistory);
+    PerformanceMonitor.mark('chat-start');
+    
+    // UIの更新を並行処理で最適化
+    startChatTransition(() => {
+      const newHistory: ChatMessage[] = [
+        ...chatHistory,
+        { role: "user", content: userQuestion },
+      ];
+      setChatHistory(newHistory);
 
-    try {
-      const res = await fetch("/api/chat", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          code: request.code,
-          language: request.language,
-          level: request.level,
-          question: userQuestion,
-          history: chatHistory,
-        }),
-      });
-      const data = await res.json();
-      if (!res.ok) {
-        setChatHistory([
-          ...newHistory,
-          { role: "assistant", content: `エラー: ${data.error ?? "回答の生成に失敗しました"}` },
-        ]);
-        return;
-      }
-      setChatHistory([
-        ...newHistory,
-        { role: "assistant", content: data.answer },
-      ]);
-    } catch {
-      setChatHistory([
-        ...newHistory,
-        { role: "assistant", content: "ネットワークエラーが発生しました" },
-      ]);
-    } finally {
-      setChatLoading(false);
-      // フォーカスを非同期で設定
-      requestAnimationFrame(() => {
-        questionInputRef.current?.focus();
-      });
-    }
+      // チャット処理を非同期実行
+      (async () => {
+        try {
+          const res = await fetch("/api/chat", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              code: request.code,
+              language: request.language,
+              level: request.level,
+              question: userQuestion,
+              history: chatHistory,
+            }),
+          });
+          
+          const data = await res.json();
+          
+          if (!res.ok) {
+            setChatHistory([
+              ...newHistory,
+              { role: "assistant", content: `エラー: ${data.error ?? "回答の生成に失敗しました"}` },
+            ]);
+            return;
+          }
+          
+          setChatHistory([
+            ...newHistory,
+            { role: "assistant", content: data.answer },
+          ]);
+          
+          PerformanceMonitor.measure('chat-complete', 'chat-start');
+          
+        } catch {
+          setChatHistory([
+            ...newHistory,
+            { role: "assistant", content: "ネットワークエラーが発生しました" },
+          ]);
+        }
+      })();
+    });
+    
+    // フォーカスを非同期で設定
+    requestAnimationFrame(() => {
+      questionInputRef.current?.focus();
+    });
   }
 
   const handleQuestionChange = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
@@ -401,12 +516,19 @@ export default function ExplainPage() {
               レビューモード
             </span>
           )}
+          {/* パフォーマンス指標 */}
+          {isPending && (
+            <span className="px-2 py-0.5 rounded-full text-xs font-medium text-blue-600 bg-blue-50">
+              処理中...
+            </span>
+          )}
         </div>
+        
         <div className="flex items-center gap-2">
           {explanation && (
             <button
               onClick={handleCopy}
-              className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg border text-xs font-medium transition-all"
+              className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg border text-xs font-medium transition-all hover:shadow-sm"
               style={{ borderColor: "var(--border)", color: "var(--muted)", background: "var(--surface)" }}
             >
               {copied ? <Check className="w-3.5 h-3.5 text-green-500" /> : <Copy className="w-3.5 h-3.5" />}
@@ -414,8 +536,12 @@ export default function ExplainPage() {
             </button>
           )}
           <button
-            onClick={() => router.push("/")}
-            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg gradient-bg text-white text-xs font-medium"
+            onClick={() => {
+              startTransition(() => {
+                router.push("/");
+              });
+            }}
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg gradient-bg text-white text-xs font-medium hover:shadow-md transition-all"
           >
             <RotateCcw className="w-3.5 h-3.5" />
             別のコードで試す
@@ -439,7 +565,7 @@ export default function ExplainPage() {
               <span>{request.code.split("\n").length} 行</span>
               {highlightLine && !notFoundFlash && (
                 <span
-                  className="px-1.5 py-0.5 rounded text-xs font-medium"
+                  className="px-1.5 py-0.5 rounded text-xs font-medium animate-pulse"
                   style={{ background: "rgba(250,204,21,0.2)", color: "#ca8a04" }}
                 >
                   → {highlightLine} 行目
@@ -503,30 +629,30 @@ export default function ExplainPage() {
                 <p>{error}</p>
                 <button
                   onClick={() => generateExplanation(request)}
-                  className="mt-2 text-red-600 underline text-xs"
+                  className="mt-2 text-red-600 underline text-xs hover:no-underline transition-all"
                 >
                   再試行する
                 </button>
               </div>
             )}
 
-            {explanation && (
+            {deferredExplanation && (
               <div className="prose max-w-none">
                 <LazyCodeJumpMarkdown
-                  markdown={explanation}
+                  markdown={deferredExplanation}
                   onCodeClick={jumpToCode}
                 />
               </div>
             )}
 
-            {/* Chat history */}
-            {chatHistory.length > 0 && (
+            {/* Chat history - deferredValue でパフォーマンス最適化 */}
+            {deferredChatHistory.length > 0 && (
               <div className="space-y-4 pt-4 border-t" style={{ borderColor: "var(--border)" }}>
                 <p className="text-xs font-medium" style={{ color: "var(--muted)" }}>
                   <ChevronDown className="w-3 h-3 inline mr-1" />
                   追加の質問と回答
                 </p>
-                {chatHistory.map((msg, i) => (
+                {deferredChatHistory.map((msg, i) => (
                   <div
                     key={i}
                     className={msg.role === "user" ? "flex justify-end" : ""}
@@ -554,7 +680,7 @@ export default function ExplainPage() {
                     )}
                   </div>
                 ))}
-                {chatLoading && (
+                {chatPending && (
                   <div className="flex items-center gap-2 text-sm" style={{ color: "var(--muted)" }}>
                     <Loader2 className="w-4 h-4 animate-spin" />
                     回答を生成中...
@@ -579,8 +705,8 @@ export default function ExplainPage() {
                 onChange={handleQuestionChange}
                 onKeyDown={handleKeyDown}
                 placeholder="このコードについて質問する..."
-                disabled={loading || chatLoading}
-                className="flex-1 px-3 py-2 rounded-lg border text-sm"
+                disabled={loading || chatPending}
+                className="flex-1 px-3 py-2 rounded-lg border text-sm focus:ring-2 focus:ring-purple-500 focus:border-transparent transition-all"
                 style={{
                   background: "var(--surface)",
                   borderColor: "var(--border)",
@@ -589,10 +715,10 @@ export default function ExplainPage() {
               />
               <button
                 onClick={debouncedSendQuestion}
-                disabled={!question.trim() || loading || chatLoading}
-                className="px-3 py-2 rounded-lg gradient-bg text-white disabled:opacity-50 transition-opacity"
+                disabled={!question.trim() || loading || chatPending}
+                className="px-3 py-2 rounded-lg gradient-bg text-white disabled:opacity-50 transition-all hover:shadow-md disabled:hover:shadow-none"
               >
-                {chatLoading ? (
+                {chatPending ? (
                   <Loader2 className="w-4 h-4 animate-spin" />
                 ) : (
                   <Send className="w-4 h-4" />
