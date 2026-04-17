@@ -1,9 +1,10 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useCallback, useTransition, startTransition } from "react";
 import { useRouter } from "next/navigation";
 import { BookOpen, GitBranch, FolderOpen, Loader2, ChevronRight } from "lucide-react";
 import { clsx } from "clsx";
+import { preloadRoute } from "@/lib/performance";
 
 const LANGUAGES = [
   "TypeScript",
@@ -24,6 +25,7 @@ type Mode = "explain" | "review";
 
 export default function HomePage() {
   const router = useRouter();
+  const [isPending, startTransition] = useTransition();
 
   const [tab, setTab] = useState<Tab>("paste");
   const [code, setCode] = useState("");
@@ -33,11 +35,15 @@ export default function HomePage() {
   const [companyPath, setCompanyPath] = useState("");
   const [loadingGithub, setLoadingGithub] = useState(false);
   const [githubError, setGithubError] = useState("");
-  const [submitting, setSubmitting] = useState(false);
 
-  const canSubmit = code.trim().length > 0 && !submitting;
+  const canSubmit = code.trim().length > 0 && !isPending;
 
-  async function handleLoadGithub(type: "url" | "company") {
+  // 説明ページのプリロード
+  useState(() => {
+    preloadRoute("/explain");
+  });
+
+  const handleLoadGithub = useCallback(async (type: "url" | "company") => {
     const value = type === "url" ? githubUrl : companyPath;
     if (!value.trim()) return;
 
@@ -64,17 +70,41 @@ export default function HomePage() {
     } finally {
       setLoadingGithub(false);
     }
-  }
+  }, [githubUrl, companyPath]);
 
-  function handleSubmit(mode: Mode) {
+  const handleSubmit = useCallback((mode: Mode) => {
     if (!canSubmit) return;
-    setSubmitting(true);
-    sessionStorage.setItem(
-      "review-request",
-      JSON.stringify({ code, language, level, mode })
-    );
-    router.push("/explain");
-  }
+    
+    startTransition(() => {
+      sessionStorage.setItem(
+        "review-request",
+        JSON.stringify({ code, language, level, mode })
+      );
+      router.push("/explain");
+    });
+  }, [code, language, level, canSubmit, router]);
+
+  const handleCodeChange = useCallback((e: React.ChangeEvent<HTMLTextAreaElement>) => {
+    setCode(e.target.value);
+  }, []);
+
+  const handleLanguageChange = useCallback((e: React.ChangeEvent<HTMLSelectElement>) => {
+    setLanguage(e.target.value);
+  }, []);
+
+  const handleLevelChange = useCallback((newLevel: Level) => {
+    setLevel(newLevel);
+  }, []);
+
+  const handleKeyDown = useCallback((e: React.KeyboardEvent) => {
+    if (e.key === "Enter") {
+      if (tab === "github-url" && githubUrl.trim()) {
+        handleLoadGithub("url");
+      } else if (tab === "company" && companyPath.trim()) {
+        handleLoadGithub("company");
+      }
+    }
+  }, [tab, githubUrl, companyPath, handleLoadGithub]);
 
   return (
     <div className="min-h-screen" style={{ background: "var(--background)" }}>
@@ -136,7 +166,7 @@ export default function HomePage() {
                   borderColor: "var(--border)",
                   color: "var(--foreground)",
                 }}
-                onKeyDown={(e) => e.key === "Enter" && handleLoadGithub("url")}
+                onKeyDown={handleKeyDown}
               />
               <button
                 onClick={() => handleLoadGithub("url")}
@@ -174,7 +204,7 @@ export default function HomePage() {
                   borderColor: "var(--border)",
                   color: "var(--foreground)",
                 }}
-                onKeyDown={(e) => e.key === "Enter" && handleLoadGithub("company")}
+                onKeyDown={handleKeyDown}
               />
               <button
                 onClick={() => handleLoadGithub("company")}
@@ -206,7 +236,7 @@ export default function HomePage() {
           </label>
           <textarea
             value={code}
-            onChange={(e) => setCode(e.target.value)}
+            onChange={handleCodeChange}
             placeholder="ここにコードを貼り付けてください..."
             rows={20}
             className="w-full px-4 py-3 rounded-lg border text-sm resize-y"
@@ -228,7 +258,7 @@ export default function HomePage() {
             </label>
             <select
               value={language}
-              onChange={(e) => setLanguage(e.target.value)}
+              onChange={handleLanguageChange}
               className="w-full px-3 py-2 rounded-lg border text-sm"
               style={{
                 background: "var(--surface)",
@@ -271,7 +301,7 @@ export default function HomePage() {
                     name="level"
                     value={value}
                     checked={level === value}
-                    onChange={() => setLevel(value)}
+                    onChange={() => handleLevelChange(value)}
                     className="mt-0.5"
                   />
                   <div>
@@ -291,7 +321,7 @@ export default function HomePage() {
             disabled={!canSubmit}
             className="flex items-center gap-2 px-6 py-3 rounded-lg gradient-bg text-white font-medium disabled:opacity-50 transition-opacity"
           >
-            {submitting ? <Loader2 className="w-4 h-4 animate-spin" /> : <BookOpen className="w-4 h-4" />}
+            {isPending ? <Loader2 className="w-4 h-4 animate-spin" /> : <BookOpen className="w-4 h-4" />}
             解説する
           </button>
           <button
@@ -304,7 +334,7 @@ export default function HomePage() {
               background: "var(--surface)",
             }}
           >
-            {submitting ? <Loader2 className="w-4 h-4 animate-spin" /> : <ChevronRight className="w-4 h-4" />}
+            {isPending ? <Loader2 className="w-4 h-4 animate-spin" /> : <ChevronRight className="w-4 h-4" />}
             レビューする
           </button>
         </div>
